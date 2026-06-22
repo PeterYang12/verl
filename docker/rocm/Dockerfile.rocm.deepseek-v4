@@ -235,7 +235,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install flash-linear-attention
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    cd /workspace && git clone https://github.com/verl-project/verl.git && \
+    cd /workspace && git clone -b dsv4-rollout https://github.com/PeterYang12/verl.git && \
     cd verl && pip install .
 
 # (6) Pin fastapi < 0.137. vLLM has no upper bound on fastapi, so the latest
