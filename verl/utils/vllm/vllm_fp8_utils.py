@@ -30,12 +30,13 @@ except ImportError as e:
     raise ImportError("FP8 quantization not available") from e
 
 # Some vLLM builds (e.g. certain ROCm builds, or when the fused MoE backend is
-# unavailable) export ``FusedMoE`` as ``None`` instead of a class. ``isinstance``
-# requires a type as its second argument, so the bare ``None`` would raise
+# unavailable) export ``FusedMoE`` as ``None`` -- or as some other non-class
+# object -- instead of an actual class. ``isinstance`` requires a type as its
+# second argument, so any non-type value would raise
 # ``TypeError: isinstance() arg 2 must be a type ...`` in the checks below. Fall
 # back to a sentinel class that no real module will ever be an instance of, so
 # every ``isinstance(module, FusedMoE)`` check simply evaluates to ``False``.
-if FusedMoE is None:
+if not isinstance(FusedMoE, type):
 
     class _UnavailableFusedMoE:
         pass
