@@ -51,9 +51,31 @@ def init_megatron_optim_config(
                 "params_dtype": torch.bfloat16,
             }
         )
+    # OptimizerConfig fields that are typed as torch.dtype. Hydra can only pass
+    # strings from the CLI, so map common aliases to the corresponding torch dtype.
+    _DTYPE_FIELDS = ("main_grads_dtype", "main_params_dtype", "exp_avg_dtype", "exp_avg_sq_dtype")
+    _DTYPE_ALIASES = {
+        "fp32": torch.float32,
+        "float32": torch.float32,
+        "torch.float32": torch.float32,
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "torch.bfloat16": torch.bfloat16,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "torch.float16": torch.float16,
+    }
+
     override_config = optim_config.get("override_optimizer_config", {})
     if override_config:
         for k, v in override_config.items():
+            if k in _DTYPE_FIELDS and isinstance(v, str):
+                if v not in _DTYPE_ALIASES:
+                    raise ValueError(
+                        f"Unsupported dtype string '{v}' for optimizer field '{k}'. "
+                        f"Expected one of {sorted(_DTYPE_ALIASES)}."
+                    )
+                v = _DTYPE_ALIASES[v]
             optim_args[k] = v
 
     print_rank_0(f"optimizer config after override: {optim_args}")
