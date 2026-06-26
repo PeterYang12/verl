@@ -29,6 +29,19 @@ try:
 except ImportError as e:
     raise ImportError("FP8 quantization not available") from e
 
+# Some vLLM builds (e.g. certain ROCm builds, or when the fused MoE backend is
+# unavailable) export ``FusedMoE`` as ``None`` instead of a class. ``isinstance``
+# requires a type as its second argument, so the bare ``None`` would raise
+# ``TypeError: isinstance() arg 2 must be a type ...`` in the checks below. Fall
+# back to a sentinel class that no real module will ever be an instance of, so
+# every ``isinstance(module, FusedMoE)`` check simply evaluates to ``False``.
+if FusedMoE is None:
+
+    class _UnavailableFusedMoE:
+        pass
+
+    FusedMoE = _UnavailableFusedMoE
+
 from verl.utils.device import get_device_name
 from verl.utils.kernel.fp8_kernel import scaled_fp8_blockwise
 
