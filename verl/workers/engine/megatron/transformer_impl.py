@@ -190,7 +190,11 @@ class MegatronEngine(BaseEngine):
 
             bridge = AutoBridge.from_config(self.model_config.hf_config, dtype=self.param_dtype)
             if not self.model_config.mtp.enable:
-                override_transformer_config["mtp_num_layers"] = 0
+                # Use None (not 0) to fully disable MTP: recent Megatron-Core
+                # (e.g. the DSv4 dev commit) rejects `mtp_num_layers is not None`
+                # together with enable_hyper_connections, so 0 still trips the
+                # `enable_hyper_connections is not compatible with MTP` check.
+                override_transformer_config["mtp_num_layers"] = None
             bridge.set_extra_args(**override_transformer_config)
             if not self.model_config.mtp.enable:
                 csa = getattr(bridge.config, "csa_compress_ratios", None)
@@ -229,7 +233,9 @@ class MegatronEngine(BaseEngine):
             for key, value in override_transformer_config.items():
                 provider_overrides[key] = value
             if not self.model_config.mtp.enable:
-                provider_overrides["mtp_num_layers"] = 0
+                # None (not 0) fully disables MTP; recent Megatron-Core rejects
+                # mtp_num_layers != None alongside enable_hyper_connections (DSv4).
+                provider_overrides["mtp_num_layers"] = None
                 csa_compress_ratios = getattr(provider, "csa_compress_ratios", None)
                 if csa_compress_ratios is not None:
                     provider_overrides["csa_compress_ratios"] = csa_compress_ratios[: provider.num_layers]
