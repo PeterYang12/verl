@@ -229,10 +229,41 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -U git+https://github.com/ISEEKYAN/mbridge.git@v0.15.1 && \
     pip install transformers --upgrade && \
-    pip install megatron-core==0.16.0 && \
     pip install mathruler && \
     pip install qwen_vl_utils && \
     pip install flash-linear-attention
+
+# (7) DeepSeek-V4 Megatron training stack (verl's vanilla_mbridge=False path).
+#     Verified working in-container (config build -> MLAModelProvider for
+#     DeepSeek-V4-Flash). Three coupled pieces:
+#       a. Megatron-Core: NVIDIA/Megatron-LM @ cf081d5 (v0.18 "dev" commit).
+#          This commit ships the DeepSeek-V4 bits (tid2eid hash routing, dsa.py,
+#          sqrtsoftplus scoring, csa_compress_ratios). It is the exact dev commit
+#          that Megatron-Bridge 0.5.0 pins (.dev.commit). The stock
+#          `megatron-core==0.16.0` wheel is TOO OLD for this bridge and fails to
+#          import (`cannot import name 'get_hybrid_total_layer_count'`), so we
+#          source-install cf081d5 instead. `-e . --no-deps` (pure-python core,
+#          no compile needed) so it does not disturb the ROCm torch/TE stack.
+#       b. Megatron-Bridge: radixark fork @ 318c5ff0 provides `megatron.bridge`
+#          with `deepseek_v4_bridge.py`. Installed `--no-deps` (like upstream
+#          Miles) so its huge requires list (flashinfer, megatron-core[dev,mlm],
+#          etc.) does not churn / downgrade the carefully built ROCm stack.
+#       c. nvidia-modelopt (+ pulp) are import-time deps of `megatron.bridge`.
+#     No radixark Megatron-LM fork and no ROCm source patches are needed: this
+#     dev commit's clip_grads already falls back to local impls on ROCm.
+ARG MEGATRON_LM_REPO="https://github.com/NVIDIA/Megatron-LM.git"
+ARG MEGATRON_LM_COMMIT="cf081d5df0b34b665d214ff936f27489d7396876"
+ARG MEGATRON_BRIDGE_REPO="https://github.com/radixark/Megatron-Bridge.git"
+ARG MEGATRON_BRIDGE_COMMIT="318c5ff0369c1086a3852ff018a1d87ba3b36077"
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-deps "nvidia-modelopt>=0.37.0" "pulp<4.0" && \
+    git clone ${MEGATRON_LM_REPO} /opt/Megatron-LM && \
+    cd /opt/Megatron-LM && \
+    git fetch --depth 1 origin ${MEGATRON_LM_COMMIT} && \
+    git checkout ${MEGATRON_LM_COMMIT} && \
+    pip install -e . --no-deps && \
+    pip install --no-deps --no-build-isolation --ignore-requires-python \
+      git+${MEGATRON_BRIDGE_REPO}@${MEGATRON_BRIDGE_COMMIT}
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /workspace && git clone -b dsv4-rollout https://github.com/PeterYang12/verl.git && \
