@@ -43,6 +43,25 @@ if not isinstance(FusedMoE, type):
 
     FusedMoE = _UnavailableFusedMoE
 
+# Newer vLLM builds (the ``RoutedExperts`` refactor, e.g. the DeepSeek-V4 AMD
+# path) turn ``FusedMoE`` into a *factory function* that returns a ``MoERunner``
+# rather than a class. The sentinel above therefore replaces ``FusedMoE`` with a
+# dummy type, so every ``isinstance(module, FusedMoE)`` check silently becomes
+# ``False``. In that architecture the expert weights (``w13_weight`` /
+# ``w2_weight`` / scales) and the ``quant_method`` no longer live on the
+# ``FusedMoE`` wrapper but on a nested ``RoutedExperts`` submodule (named
+# ``routed_experts``). Recognise that module so MXFP4/FP8 detection and the
+# pre-reload weight restoration keep working for online weight sync.
+try:
+    from vllm.model_executor.layers.fused_moe.routed_experts import (
+        RoutedExperts as _RoutedExperts,
+    )
+except Exception:  # pragma: no cover - older vLLM without RoutedExperts
+    _RoutedExperts = None
+
+if not isinstance(_RoutedExperts, type):
+    _RoutedExperts = None
+
 from verl.utils.device import get_device_name
 from verl.utils.kernel.fp8_kernel import scaled_fp8_blockwise
 
@@ -310,8 +329,22 @@ def _ensure_model_params_reloadable(model):
             _ensure_linear_params_reloadable(module)
 
 
+def _is_fused_moe_expert_module(module):
+    """Whether ``module`` is a vLLM fused-MoE expert container.
+
+    Handles both the legacy ``FusedMoE`` class and the newer ``RoutedExperts``
+    submodule that owns the expert weights / ``quant_method`` after vLLM turned
+    ``FusedMoE`` into a factory function.
+    """
+    if isinstance(module, FusedMoE):
+        return True
+    if _RoutedExperts is not None and isinstance(module, _RoutedExperts):
+        return True
+    return False
+
+
 def _is_mxfp4_moe_module(module):
-    if not isinstance(module, FusedMoE):
+    if not _is_fused_moe_expert_module(module):
         return False
     quant_method = getattr(module, "quant_method", None)
     quant_method_name = type(quant_method).__name__
@@ -491,7 +524,7 @@ def get_module_from_param_name(model, name: str):
         try:
             # Traverse the model hierarchy
             for part in module_path:
-                if isinstance(current_module, FusedMoE):
+                if _is_fused_moe_expert_module(current_module):
                     return current_module
                 elif isinstance(current_module, torch.nn.ModuleList):
                     current_module = current_module[int(part)]
@@ -515,8 +548,10 @@ def is_fp8_weight(name, model):
             if module is not None and (
                 (isinstance(module, LinearBase) and module.weight.dtype == torch.float8_e4m3fn)
                 or (
-                    isinstance(module, FusedMoE)
+                    _is_fused_moe_expert_module(module)
+                    and getattr(module, "w13_weight", None) is not None
                     and module.w13_weight.dtype == torch.float8_e4m3fn
+                    and getattr(module, "w2_weight", None) is not None
                     and module.w2_weight.dtype == torch.float8_e4m3fn
                 )
             ):
