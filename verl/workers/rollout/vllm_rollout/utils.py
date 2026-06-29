@@ -352,6 +352,20 @@ class vLLMColocateWorkerExtension:
             self.add_lora(lora_request)
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
         else:
+            # ===== TEMP DEBUG (remove after diagnosing DSv4 routed_experts KeyError) =====
+            # Materialize so we can both inspect names and re-iterate downstream safely
+            # (split_buffer_updates + load also iterate `weights`).
+            if not isinstance(weights, (list, dict)):
+                weights = list(weights)
+            try:
+                _names = list(weights.keys()) if isinstance(weights, dict) else [n for (n, _t) in weights]
+                _exp = [n for n in _names if "layers.0." in n and "expert" in n]
+                _rt = [n for n in _names if "routed_experts" in n]
+                logger.warning("VERL_DEBUG layer0 expert names (%d): %s", len(_exp), _exp[:20])
+                logger.warning("VERL_DEBUG routed_experts names total (%d): %s", len(_rt), _rt[:10])
+            except Exception as _e:  # noqa: BLE001
+                logger.warning("VERL_DEBUG name dump failed: %s", _e)
+            # ===== END TEMP DEBUG =====
             param_updates, buffer_updates, named_buffers = split_buffer_updates(self.model_runner.model, weights)
             # Add the FP8 related logic here as sharding manager has been deprecated.
             # Check if FP8 quantization is enabled and apply appropriate weight loading
