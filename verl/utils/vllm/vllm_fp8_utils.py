@@ -564,6 +564,14 @@ def is_mxfp4_moe_weight(name, tensor, model):
         return False
     if _is_prequantized_mxfp4_tensor(tensor):
         return False
+    # DeepSeek-V4: routed experts use MXFP4 (Mxfp4MoEMethod) while the shared
+    # experts / dense linears use FP8. On the newer vLLM ``RoutedExperts``
+    # architecture the per-expert incoming names (``...experts.<id>.w{1,3}.weight``)
+    # cannot be resolved to a module via ``get_module_from_param_name`` (there is
+    # no per-expert submodule), so fall back to a model-type shortcut to ensure
+    # the bf16 weights coming over the wire are quantized to MXFP4 before load.
+    if ".shared_experts." not in name and _model_type(model) == "deepseek_v4":
+        return True
     module = get_module_from_param_name(model, name)
     return _is_mxfp4_moe_module(module)
 
