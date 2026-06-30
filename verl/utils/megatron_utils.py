@@ -490,7 +490,50 @@ def _can_safely_resize_storage(tensor: torch.Tensor) -> bool:
     )
 
 
-_GRAD_OFFLOAD_DEBUG_BUDGET = 12
+_GRAD_OFFLOAD_DEBUG_BUDGET = 200
+
+
+def _grad_offload_debug_report(model_chunk, all_buffers, load_grad):
+    """One compact line per reload call: grad-buffer storage state plus a scan of
+    every trainable param's ``main_grad`` storage. This pinpoints whether
+    ``main_grad`` still aliases the (restored) ``buffer.grad_data`` or has been
+    re-pointed to a separate buffer that offload/reload does not manage."""
+    rank = _grad_offload_debug_rank()
+    try:
+        buf_states = []
+        grad_data_ptrs = set()
+        for buffers in all_buffers:
+            for buffer in buffers:
+                gd = buffer.grad_data
+                buf_states.append(gd.storage().size())
+                if gd.storage().size() > 0:
+                    grad_data_ptrs.add(gd.data_ptr())
+        n_params = 0
+        n_main_grad = 0
+        n_main_grad_zero_storage = 0
+        for _, param in model_chunk.module.named_parameters():
+            if not param.requires_grad:
+                continue
+            n_params += 1
+            mg = getattr(param, "main_grad", None)
+            if mg is None:
+                continue
+            n_main_grad += 1
+            try:
+                if mg.untyped_storage().size() == 0:
+                    n_main_grad_zero_storage += 1
+            except Exception:
+                n_main_grad_zero_storage += 1
+        print(
+            f"[VERL_DEBUG_GRAD_OFFLOAD][reload][rank{rank}] load_grad={load_grad} "
+            f"num_buffers={len(buf_states)} grad_storage_min={min(buf_states) if buf_states else 'NA'} "
+            f"grad_storage_max={max(buf_states) if buf_states else 'NA'} "
+            f"trainable_params={n_params} with_main_grad={n_main_grad} "
+            f"main_grad_ZERO_storage={n_main_grad_zero_storage}",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[VERL_DEBUG_GRAD_OFFLOAD][reload][rank{rank}] report_error={e!r}", flush=True)
 
 
 def _grad_offload_debug_rank():
@@ -622,13 +665,6 @@ def load_megatron_model_to_gpu(models, load_grad=True, load_frozen_params=True):
     """
     _dbg = _grad_offload_debug_should_print()
     for model_chunk in models:
-        if _dbg:
-            print(
-                f"[VERL_DEBUG_GRAD_OFFLOAD][reload][rank{_grad_offload_debug_rank()}] "
-                f"model_chunk_type={type(model_chunk).__name__} "
-                f"is_DDP={isinstance(model_chunk, DDP)} load_grad={load_grad}",
-                flush=True,
-            )
         if isinstance(model_chunk, DDP):
             model_chunk_all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
             for buffers in model_chunk_all_buffers:
@@ -655,21 +691,13 @@ def load_megatron_model_to_gpu(models, load_grad=True, load_frozen_params=True):
                         if buffer.grad_data.storage().size() > 0:
                             buffer.grad_data.zero_()
 
-                    if _dbg:
-                        print(
-                            f"[VERL_DEBUG_GRAD_OFFLOAD][reload][rank{_grad_offload_debug_rank()}] "
-                            f"load_grad={load_grad} "
-                            f"grad_numel={buffer.grad_data.numel()} "
-                            f"grad_storage={buffer.grad_data.storage().size()} "
-                            f"has_grad_data_size_attr={hasattr(buffer, 'grad_data_size')} "
-                            f"param_storage={buffer.param_data.storage().size()}",
-                            flush=True,
-                        )
-
                     if buffer.param_data.storage().size() == 0:
                         buffer.param_data.storage().resize_(buffer.param_data_size)
                         # copy data from cpu to cuda
                         buffer.param_data.copy_(buffer.param_data.cpu_data, non_blocking=True)
+
+            if _dbg:
+                _grad_offload_debug_report(model_chunk, model_chunk_all_buffers, load_grad)
 
             # Load frozen parameters that were offloaded (e.g. base model in LoRA/PEFT)
             if load_frozen_params:
