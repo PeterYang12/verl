@@ -548,6 +548,18 @@ def offload_megatron_model_to_cpu(models):
 
                     assert buffer.param_data_size == buffer.param_data.cpu_data.storage().size()
 
+                    if os.environ.get("VERL_DEBUG_GRAD_OFFLOAD", "0") == "1":
+                        try:
+                            _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                        except Exception:
+                            _rank = 0
+                        print(
+                            f"[VERL_DEBUG_GRAD_OFFLOAD][offload][rank{_rank}] "
+                            f"grad_numel={buffer.grad_data.numel()} "
+                            f"grad_storage_before={buffer.grad_data.storage().size()}",
+                            flush=True,
+                        )
+
                     if buffer.grad_data.storage().size() > 0:
                         # if the grad_data size is already zero, we assume that it is already offloaded
                         buffer.grad_data_size = buffer.grad_data.storage().size()
@@ -589,16 +601,41 @@ def load_megatron_model_to_gpu(models, load_grad=True, load_frozen_params=True):
             for buffers in model_chunk_all_buffers:
                 for buffer in buffers:
                     # sometimes, we don't want to load grad for pure inference
-                    if load_grad and hasattr(buffer, "grad_data_size"):
+                    if load_grad:
+                        # `grad_data` is a flat 1-D buffer; `param.main_grad` is a
+                        # view that shares its storage. offload frees the storage via
+                        # `resize_(0)`, which leaves `grad_data.numel()` (logical
+                        # shape) intact while `storage().size()` becomes 0. We must
+                        # restore the storage so that every `main_grad` view is backed
+                        # again before backward writes into it.
+                        #
+                        # Do NOT gate this on a previously-recorded `grad_data_size`
+                        # attribute: with some distributed-optimizer configs (e.g.
+                        # `use_precision_aware_optimizer`) the grad buffer is allocated
+                        # lazily, so the first (init-time) offload sees size 0 and never
+                        # records `grad_data_size`. Relying on `numel()` makes reload
+                        # correct regardless of when the buffer was first allocated.
+                        target_numel = buffer.grad_data.numel()
                         current_storage_size = buffer.grad_data.storage().size()
-                        if current_storage_size == 0 or current_storage_size == buffer.grad_data_size:
-                            buffer.grad_data.storage().resize_(buffer.grad_data_size)
+                        if target_numel > 0 and current_storage_size < target_numel:
+                            buffer.grad_data.storage().resize_(target_numel)
+                        if buffer.grad_data.storage().size() > 0:
                             buffer.grad_data.zero_()
-                        else:
-                            # Non-standard layers (e.g. GatedDeltaNet) may have grad
-                            # buffers with mismatched storage size; skip resize and
-                            # zero in-place with current storage.
-                            buffer.grad_data.zero_()
+
+                    if os.environ.get("VERL_DEBUG_GRAD_OFFLOAD", "0") == "1":
+                        try:
+                            _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                        except Exception:
+                            _rank = 0
+                        print(
+                            f"[VERL_DEBUG_GRAD_OFFLOAD][reload][rank{_rank}] "
+                            f"load_grad={load_grad} "
+                            f"grad_numel={buffer.grad_data.numel()} "
+                            f"grad_storage={buffer.grad_data.storage().size()} "
+                            f"has_grad_data_size_attr={hasattr(buffer, 'grad_data_size')} "
+                            f"param_storage={buffer.param_data.storage().size()}",
+                            flush=True,
+                        )
 
                     if buffer.param_data.storage().size() == 0:
                         buffer.param_data.storage().resize_(buffer.param_data_size)
