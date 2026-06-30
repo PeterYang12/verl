@@ -491,6 +491,33 @@ def _can_safely_resize_storage(tensor: torch.Tensor) -> bool:
 
 
 @torch.no_grad()
+_GRAD_OFFLOAD_DEBUG_BUDGET = 12
+
+
+def _grad_offload_debug_rank():
+    try:
+        return torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    except Exception:
+        return 0
+
+
+def _grad_offload_debug_should_print():
+    """Throttled, env-independent debug switch.
+
+    Ray worker actors do not necessarily inherit shell env vars, so we do NOT
+    gate on an env var. Instead we print the first few offload/reload events per
+    process to surface grad-buffer storage state, then go quiet to avoid spam.
+    Set VERL_DEBUG_GRAD_OFFLOAD=0 to force-disable.
+    """
+    global _GRAD_OFFLOAD_DEBUG_BUDGET
+    if os.environ.get("VERL_DEBUG_GRAD_OFFLOAD", "1") == "0":
+        return False
+    if _GRAD_OFFLOAD_DEBUG_BUDGET <= 0:
+        return False
+    _GRAD_OFFLOAD_DEBUG_BUDGET -= 1
+    return True
+
+
 def offload_megatron_model_to_cpu(models):
     """
     In megatron, the model and optimizer storage are:
@@ -499,6 +526,7 @@ def offload_megatron_model_to_cpu(models):
     - fp32 main_parameter chunked in model and dp group
     - fp32 optimizer state chunked in model and dp group
     """
+    _off_dbg = _grad_offload_debug_should_print()
     for model_chunk in models:
         if isinstance(model_chunk, DDP):
             model_chunk_all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
@@ -548,13 +576,10 @@ def offload_megatron_model_to_cpu(models):
 
                     assert buffer.param_data_size == buffer.param_data.cpu_data.storage().size()
 
-                    if os.environ.get("VERL_DEBUG_GRAD_OFFLOAD", "0") == "1":
-                        try:
-                            _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                        except Exception:
-                            _rank = 0
+                    if _off_dbg:
                         print(
-                            f"[VERL_DEBUG_GRAD_OFFLOAD][offload][rank{_rank}] "
+                            f"[VERL_DEBUG_GRAD_OFFLOAD][offload][rank{_grad_offload_debug_rank()}] "
+                            f"model_chunk_type={type(model_chunk).__name__} "
                             f"grad_numel={buffer.grad_data.numel()} "
                             f"grad_storage_before={buffer.grad_data.storage().size()}",
                             flush=True,
@@ -595,7 +620,15 @@ def load_megatron_model_to_gpu(models, load_grad=True, load_frozen_params=True):
         load_grad: Whether to load gradients.
         load_frozen_params: Whether to load frozen parameters.
     """
+    _dbg = _grad_offload_debug_should_print()
     for model_chunk in models:
+        if _dbg:
+            print(
+                f"[VERL_DEBUG_GRAD_OFFLOAD][reload][rank{_grad_offload_debug_rank()}] "
+                f"model_chunk_type={type(model_chunk).__name__} "
+                f"is_DDP={isinstance(model_chunk, DDP)} load_grad={load_grad}",
+                flush=True,
+            )
         if isinstance(model_chunk, DDP):
             model_chunk_all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
             for buffers in model_chunk_all_buffers:
@@ -622,13 +655,9 @@ def load_megatron_model_to_gpu(models, load_grad=True, load_frozen_params=True):
                         if buffer.grad_data.storage().size() > 0:
                             buffer.grad_data.zero_()
 
-                    if os.environ.get("VERL_DEBUG_GRAD_OFFLOAD", "0") == "1":
-                        try:
-                            _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                        except Exception:
-                            _rank = 0
+                    if _dbg:
                         print(
-                            f"[VERL_DEBUG_GRAD_OFFLOAD][reload][rank{_rank}] "
+                            f"[VERL_DEBUG_GRAD_OFFLOAD][reload][rank{_grad_offload_debug_rank()}] "
                             f"load_grad={load_grad} "
                             f"grad_numel={buffer.grad_data.numel()} "
                             f"grad_storage={buffer.grad_data.storage().size()} "
