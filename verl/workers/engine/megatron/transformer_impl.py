@@ -493,6 +493,18 @@ class MegatronEngine(BaseEngine):
         """
         Zero out gradients of all parameters before starting a new backward pass.
         """
+        # Within a single update (one train_mode context) verl reloads grad
+        # buffers only once, but several mini-batches run inside it. The
+        # distributed optimizer can free the flat grad buffer during step(),
+        # leaving every param.main_grad (a view into it) without storage and
+        # crashing the next mini-batch's backward. Restore the buffers' storage
+        # here so the upcoming backward always has a valid main_grad.
+        from verl.utils.megatron_utils import ensure_megatron_grad_buffers_on_gpu
+
+        restored = ensure_megatron_grad_buffers_on_gpu(self.module)
+        if restored and os.environ.get("VERL_DEBUG_GRAD_OFFLOAD", "1") != "0":
+            logger.info(f"[VERL_DEBUG_GRAD_OFFLOAD][optimizer_zero_grad] restored {restored} grad buffer(s) storage")
+
         self.optimizer.zero_grad()
         # use use_contiguous_buffers_in_local_ddp and no overlap_dp_param_comm
         for chunk in self.module:

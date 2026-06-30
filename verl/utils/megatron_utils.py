@@ -717,6 +717,39 @@ def load_megatron_model_to_gpu(models, load_grad=True, load_frozen_params=True):
 
 
 @torch.no_grad()
+def ensure_megatron_grad_buffers_on_gpu(models):
+    """Restore GPU storage of every DDP flat grad buffer (and rebind nothing else).
+
+    verl reloads grad buffers once when entering a ``train_mode`` context, but a
+    single ``update_actor`` runs multiple mini-batches inside that one context.
+    The Megatron distributed optimizer can free / offload the flat ``grad_data``
+    buffer during ``optimizer.step()`` (it is regenerated on the next backward),
+    which leaves every ``param.main_grad`` (a view into ``grad_data``) without
+    storage. The next mini-batch's backward then crashes in
+    ``wgrad_gemm_accum`` with "Tensor that doesn't have storage".
+
+    Call this right before zeroing grads at the start of each mini-batch so the
+    upcoming backward always has a valid buffer to accumulate into. It is cheap
+    and idempotent: it only resizes storage back up when it has shrunk, and does
+    NOT touch param storage, optimizer state, or run gc/empty_cache.
+
+    Returns the number of buffers whose storage had to be restored (useful for
+    debugging / confirming the failure mode).
+    """
+    restored = 0
+    for model_chunk in models:
+        if not isinstance(model_chunk, DDP):
+            continue
+        for buffers in (model_chunk.buffers, model_chunk.expert_parallel_buffers):
+            for buffer in buffers:
+                target_numel = buffer.grad_data.numel()
+                if target_numel > 0 and buffer.grad_data.storage().size() < target_numel:
+                    buffer.grad_data.storage().resize_(target_numel)
+                    restored += 1
+    return restored
+
+
+@torch.no_grad()
 def offload_megatron_copy_params(optimizers):
     """
     Offload optimizer parameters to CPU. Supports both Megatron optimizers
