@@ -490,7 +490,6 @@ def _can_safely_resize_storage(tensor: torch.Tensor) -> bool:
     )
 
 
-@torch.no_grad()
 _GRAD_OFFLOAD_DEBUG_BUDGET = 12
 
 
@@ -518,6 +517,7 @@ def _grad_offload_debug_should_print():
     return True
 
 
+@torch.no_grad()
 def offload_megatron_model_to_cpu(models):
     """
     In megatron, the model and optimizer storage are:
