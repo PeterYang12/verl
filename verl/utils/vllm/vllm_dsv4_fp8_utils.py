@@ -110,7 +110,7 @@ def quantize_mxfp4_weight(weight, dtype=torch.bfloat16):
     scaled = (blocks / scale).clamp(-_MXFP4_E2M1_MAX, _MXFP4_E2M1_MAX)
     thresholds = torch.tensor(_MXFP4_E2M1_THRESHOLDS, dtype=torch.float32, device=weight.device)
     magnitude = torch.bucketize(scaled.abs(), thresholds).to(torch.uint8)
-    sign = torch.where(scaled < 0, torch.full_like(magnitude, 8), torch.zeros_like(magnitude))
+    sign = torch.where(torch.signbit(scaled), torch.full_like(magnitude, 8), torch.zeros_like(magnitude))
     codes = magnitude | sign
 
     quant_weight = codes[..., 0::2] | (codes[..., 1::2] * 16)
@@ -187,10 +187,12 @@ def _make_mxfp4_moe_param(shape, device, weight_loader, quant_method=None):
 
 
 def _wrap_vllm_param(custom_param, source_param, copy_param_subclass_attrs):
-    param = torch.nn.Parameter(custom_param.data, requires_grad=False)
-    copy_param_subclass_attrs(param, source_param)
-    copy_param_subclass_attrs(param, custom_param)
-    return param
+    # Keep the original Parameter object and storage alive. DeepSeek-V4 ROCm
+    # fused modules may retain references created during model initialization;
+    # replacing the Parameter leaves those references pointing at dummy/random
+    # weights even though named_parameters() shows the newly loaded tensor.
+    copy_param_subclass_attrs(source_param, custom_param)
+    return source_param
 
 
 def _get_param_weight_loader(param):
@@ -286,8 +288,10 @@ def _attach_weight_loaders(param):
     if subclass_type is None or getattr(param, "_verl_deepseek_v4_loaders", False):
         return
 
+    original_loaders = {}
     original_column_loader = getattr(subclass_type, "load_column_parallel_weight", None)
     if original_column_loader is not None:
+        original_loaders["load_column_parallel_weight"] = getattr(param, "load_column_parallel_weight", None)
 
         def load_column_parallel_weight(self, *args, **kwargs):
             loaded_weight = kwargs.get("loaded_weight", args[0] if args else None)
@@ -303,6 +307,7 @@ def _attach_weight_loaders(param):
 
     original_row_loader = getattr(subclass_type, "load_row_parallel_weight", None)
     if original_row_loader is not None:
+        original_loaders["load_row_parallel_weight"] = getattr(param, "load_row_parallel_weight", None)
 
         def load_row_parallel_weight(self, *args, **kwargs):
             loaded_weight = kwargs.get("loaded_weight", args[0] if args else None)
@@ -314,6 +319,7 @@ def _attach_weight_loaders(param):
 
     original_merged_loader = getattr(subclass_type, "load_merged_column_weight", None)
     if original_merged_loader is not None:
+        original_loaders["load_merged_column_weight"] = getattr(param, "load_merged_column_weight", None)
 
         def load_merged_column_weight(self, *args, **kwargs):
             loaded_weight = kwargs.get("loaded_weight", args[0] if args else None)
@@ -328,7 +334,24 @@ def _attach_weight_loaders(param):
 
         param.load_merged_column_weight = MethodType(load_merged_column_weight, param)
 
+    param._verl_deepseek_v4_original_loaders = original_loaders
     param._verl_deepseek_v4_loaders = True
+
+
+def _restore_weight_loader_metadata(model):
+    for param in model.parameters():
+        original_loaders = getattr(param, "_verl_deepseek_v4_original_loaders", None)
+        if original_loaders is not None:
+            for name, loader in original_loaders.items():
+                if loader is None:
+                    param.__dict__.pop(name, None)
+                else:
+                    setattr(param, name, loader)
+            del param._verl_deepseek_v4_original_loaders
+            del param._verl_deepseek_v4_loaders
+
+        if getattr(param, "subclass_type", None) is type(param):
+            del param.subclass_type
 
 
 def _prepare_linear_params_for_loading(model, copy_param_subclass_attrs):
@@ -402,23 +425,12 @@ def _restore_moe_params_for_loading(model):
             )
             restored = True
         elif _is_mxfp4_fused_moe_module(module):
-            # vLLM stores mxfp4 experts as packed 4-bit params; the actor exports
-            # bf16 experts that verl re-quantizes to mxfp4 with **block-32**
-            # scales. Rebuild the expert params as raw ``uint8`` buffers whose
-            # shapes match verl's re-quantized output (weights packed 2 fp4/byte
-            # along the hidden dim, scales at ``dim//32``) so vLLM's expert
-            # weight_loader copies them straight in.
-            #
-            # Derive dims from the *non-packed* param dimensions so this is robust
-            # to the ``FusedMoE`` -> ``MoERunner``/``RoutedExperts`` refactor
-            # (older code read them off quant_method, which moved):
-            #   w13_weight: (num_experts, 2*intermediate, hidden//2)
-            #   w2_weight:  (num_experts, hidden,          intermediate//2)
+            # vLLM stores mxfp4 experts as packed 4-bit params; rebuild the raw
+            # loading slots before applying the backend layout conversion again.
             w13 = module.w13_weight
-            w2 = module.w2_weight
-            num_experts = w13.shape[0]
-            intermediate_size = w13.shape[1] // 2
-            hidden_size = w2.shape[1]
+            num_experts = module.local_num_experts
+            intermediate_size = module.intermediate_size_per_partition
+            hidden_size = module.hidden_size
             device = w13.device
             weight_loader = _get_param_weight_loader(w13) or getattr(module, "weight_loader", None)
             module.w13_weight = _make_mxfp4_moe_param(
@@ -453,6 +465,23 @@ def _process_moe_weights_after_loading(model):
             module.quant_method.process_weights_after_loading(module)
 
 
+def _process_linear_weights_after_loading(model):
+    for module in model.modules():
+        if not isinstance(module, LinearBase):
+            continue
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is None or not getattr(quant_method, "block_quant", False):
+            continue
+        quant_method.process_weights_after_loading(module)
+
+
+def _clear_rocm_attention_weight_caches(model):
+    """Invalidate ROCm DeepSeek-V4 weights materialized during dummy warmup."""
+    for module in model.modules():
+        if hasattr(module, "_dsv4_wo_a_bf16"):
+            del module._dsv4_wo_a_bf16
+
+
 def prepare_deepseek_v4_weights_for_loading(model, copy_param_subclass_attrs):
     _prepare_linear_params_for_loading(model, copy_param_subclass_attrs)
     return _restore_moe_params_for_loading(model)
@@ -462,6 +491,9 @@ def process_deepseek_v4_weights_after_loading(model, moe_params_restored):
     if moe_params_restored:
         _process_moe_weights_after_loading(model)
     reload_deepseek_v4_dense_fp8_scales(model)
+    _process_linear_weights_after_loading(model)
+    _restore_weight_loader_metadata(model)
+    _clear_rocm_attention_weight_caches(model)
 
 
 def _normalize_dim(dim: int, ndim: int) -> int:
