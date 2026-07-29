@@ -17,7 +17,161 @@
 # 1. `get_query_key_value_tensors` in `multi_latent_attention.py` works wrong when packed_seq_params is not None
 
 
+def apply_fast_hadamard_transform_shim():
+    """Provide a pure-torch ``fast_hadamard_transform`` when the CUDA package is absent.
+
+    DeepSeek-V4 / V3.2 sparse-attention (DSA) in Megatron-LM does
+    ``from fast_hadamard_transform import hadamard_transform`` at import time and
+    asserts it is not None inside the indexer's ``rotate_activation``. The upstream
+    Dao-AILab package only ships nvcc kernels and cannot be built on ROCm, so that
+    import yields ``None`` there and every DSA forward crashes.
+
+    Register a vectorized Fast Walsh-Hadamard Transform under the real import name
+    (fp32 butterfly accumulation, numerically equivalent to
+    ``F.linear(x, scipy.linalg.hadamard(dim)) * scale``) so any importer picks it
+    up, and back-fill modules that already captured ``None`` (e.g. Megatron's
+    ``dsa`` module at import time). No-op when the real package is installed.
+    """
+    import sys
+    import types
+
+    import torch
+
+    # Real CUDA package present and working -> leave it alone.
+    existing = sys.modules.get("fast_hadamard_transform")
+    if existing is not None and getattr(existing, "hadamard_transform", None) is not None:
+        return
+    if existing is None:
+        try:
+            import fast_hadamard_transform as existing  # noqa: F401
+
+            if getattr(existing, "hadamard_transform", None) is not None:
+                return
+        except ImportError:
+            existing = None
+
+    def hadamard_transform(x, scale=1.0):
+        """Fast Walsh-Hadamard transform along the last dim (size must be 2**k)."""
+        n = x.shape[-1]
+        if n & (n - 1) != 0:
+            raise ValueError(f"hadamard_transform requires last dim to be a power of 2, got {n}")
+        orig_dtype = x.dtype
+        orig_shape = x.shape
+        # Accumulate in fp32 for numerical stability, cast back at the end.
+        y = x.to(torch.float32).reshape(-1, n)
+        h = 1
+        while h < n:
+            y = y.view(-1, n // (2 * h), 2, h)
+            a = y[:, :, 0, :]
+            b = y[:, :, 1, :]
+            y = torch.stack((a + b, a - b), dim=2).reshape(-1, n)
+            h *= 2
+        y = y * scale
+        return y.reshape(orig_shape).to(orig_dtype)
+
+    module = existing if existing is not None else types.ModuleType("fast_hadamard_transform")
+    module.hadamard_transform = hadamard_transform
+    module.hadamard_transform_ref = hadamard_transform
+    sys.modules["fast_hadamard_transform"] = module
+
+    # Back-fill modules that already ran `from fast_hadamard_transform import
+    # hadamard_transform` and captured None (e.g. Megatron's dsa.py at import).
+    for mod in list(sys.modules.values()):
+        if mod is not None and getattr(mod, "hadamard_transform", "keep") is None:
+            mod.hadamard_transform = hadamard_transform
+
+
+def apply_patch_distopt_leaf_main_params():
+    """Fix ``ValueError: can't optimize a non-leaf Tensor`` in HybridDeviceOptimizer.
+
+    When ``optimizer_cpu_offload=True`` (HybridDeviceOptimizer, HDO) is used with
+    FP8 / quantized weights (e.g. DeepSeek-V4), Megatron's ``DistributedOptimizer``
+    builds fp32 master shards via ``model_param.float().view(-1)[start:end]``. Because
+    ``model_param`` requires grad and ``.float()`` is autograd-tracked, those shards are
+    *non-leaf* views. The plain-optimizer path assigns them straight to
+    ``optimizer.param_groups`` (no validation), but HDO re-wraps params through
+    ``torch.optim.Optimizer.__init__`` -> ``add_param_group``, which rejects non-leaf
+    tensors, raising the error at ``HybridDeviceOptimizer.__init__``.
+
+    This wraps ``_build_model_and_main_param_groups`` and, regardless of which precision
+    branch produced them, detaches every non-leaf shard in place (``.detach()`` shares
+    storage, so numerics/memory are unchanged) while preserving object identity across
+    all references -- the returned shard groups, each ``orig_group["params"]`` (exactly
+    what is handed to HDO), and the model params' ``.main_param`` handles -- so the
+    distrib-optimizer grad copy in/out and HDO's copy-back all keep pointing at the same
+    (now-leaf) tensors. TP / optimizer metadata is copied onto the leaf replacements.
+    """
+    import torch
+    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+    build_fn = DistributedOptimizer._build_model_and_main_param_groups
+    if getattr(build_fn, "_verl_leaf_patched", False):
+        return
+
+    from megatron.core.optimizer.optimizer import copy_optimizer_param_metadata
+    from megatron.core.tensor_parallel.layers import copy_tensor_model_parallel_attributes
+
+    orig = build_fn.__func__
+
+    def _to_leaf(tensor, cache):
+        if not isinstance(tensor, torch.Tensor) or tensor.is_leaf:
+            return tensor
+        cached = cache.get(id(tensor))
+        if cached is not None:
+            return cached
+        leaf = tensor.detach()
+        copy_tensor_model_parallel_attributes(leaf, tensor)
+        copy_optimizer_param_metadata(leaf, tensor)
+        cache[id(tensor)] = leaf
+        return leaf
+
+    def _build_model_and_main_param_groups(cls, gbuf_ranges, param_gbuf_map, opt_group_ranges, config):
+        result = orig(cls, gbuf_ranges, param_gbuf_map, opt_group_ranges, config)
+        (
+            model_float16_groups,
+            model_fp32_groups,
+            shard_float16_groups,
+            shard_fp32_groups,
+            shard_fp32_from_float16_groups,
+        ) = result
+
+        cache = {}
+        # Detach any non-leaf optimizer shard in place.
+        for groups in (shard_float16_groups, shard_fp32_groups, shard_fp32_from_float16_groups):
+            for group in groups:
+                for i, param in enumerate(group):
+                    group[i] = _to_leaf(param, cache)
+
+        if cache:
+            # Keep ``model_param.main_param`` handles pointing at the leaf replacements.
+            for groups in (model_float16_groups, model_fp32_groups):
+                for group in groups:
+                    for model_param in group:
+                        main_param = getattr(model_param, "main_param", None)
+                        if main_param is not None and id(main_param) in cache:
+                            model_param.main_param = cache[id(main_param)]
+            # Rewire the exact param lists handed to the (hybrid) optimizer.
+            for group_range in opt_group_ranges:
+                params = group_range["orig_group"]["params"]
+                group_range["orig_group"]["params"] = [cache.get(id(p), p) for p in params]
+
+        return result
+
+    _build_model_and_main_param_groups._verl_leaf_patched = True
+    DistributedOptimizer._build_model_and_main_param_groups = classmethod(_build_model_and_main_param_groups)
+
+
 def apply_patch():
+    # DeepSeek sparse-attention (DSA) needs ``fast_hadamard_transform``, which
+    # cannot be built on ROCm (its setup requires nvcc). Install a pure-torch
+    # fallback here (the central mcore patch entry, run right after model
+    # creation) so every DSA importer picks it up without engine-specific wiring.
+    apply_fast_hadamard_transform_shim()
+
+    # Make FP8/quantized fp32 master shards leaf tensors so HybridDeviceOptimizer
+    # (optimizer_cpu_offload=True) can wrap them without hitting the non-leaf check.
+    apply_patch_distopt_leaf_main_params()
+
     import megatron.core
     import torch
     import torch.nn.functional as F

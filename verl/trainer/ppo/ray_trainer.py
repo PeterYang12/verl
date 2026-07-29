@@ -965,8 +965,11 @@ class RayPPOTrainer:
             replicas=self.llm_server_manager.get_replicas(),
         )
 
-        # sleep all replicas to load checkpoint
-        self.checkpoint_manager.sleep_replicas()
+        self.skip_initial_weight_sync = os.getenv("VERL_SKIP_INITIAL_WEIGHT_SYNC", "0") == "1"
+        if self.skip_initial_weight_sync and "dummy" in str(self.config.actor_rollout_ref.rollout.load_format):
+            raise ValueError("VERL_SKIP_INITIAL_WEIGHT_SYNC requires a non-dummy rollout.load_format")
+        if not self.skip_initial_weight_sync:
+            self.checkpoint_manager.sleep_replicas()
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -1037,9 +1040,9 @@ class RayPPOTrainer:
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
 
-    def _load_checkpoint(self):
+    def _load_checkpoint(self, on_resume=None) -> bool:
         if self.config.trainer.resume_mode == "disable":
-            return 0
+            return False
 
         # load from hdfs
         if self.config.trainer.default_hdfs_dir is not None:
@@ -1055,7 +1058,7 @@ class RayPPOTrainer:
         if self.config.trainer.resume_mode == "auto":
             if global_step_folder is None:
                 print("Training from scratch")
-                return 0
+                return False
         else:
             if self.config.trainer.resume_mode == "resume_path":
                 assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
@@ -1072,6 +1075,9 @@ class RayPPOTrainer:
 
         print(f"Setting global step to {self.global_steps}")
         print(f"Resuming from {global_step_folder}")
+
+        if on_resume is not None:
+            on_resume()
 
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, str(Role.Critic))
@@ -1103,6 +1109,7 @@ class RayPPOTrainer:
                 self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+        return True
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
@@ -1388,9 +1395,11 @@ class RayPPOTrainer:
 
         self.global_steps = 0
 
-        # load checkpoint and update weights before doing anything
-        self._load_checkpoint()
-        self.checkpoint_manager.update_weights(self.global_steps)
+        resumed_from_checkpoint = self._load_checkpoint(
+            on_resume=self.checkpoint_manager.sleep_replicas if self.skip_initial_weight_sync else None
+        )
+        if not self.skip_initial_weight_sync or resumed_from_checkpoint:
+            self.checkpoint_manager.update_weights(self.global_steps)
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 

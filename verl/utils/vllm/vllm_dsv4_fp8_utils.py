@@ -19,6 +19,54 @@ import torch
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase
 
+# MXFP4 (E2M1 element, E8M0 block scale) quantization constants.
+_MXFP4_E2M1_MAX = 6.0
+_MXFP4_E8M0_BIAS = 127
+_MXFP4_E8M0_MIN = 1
+_MXFP4_E8M0_MAX = 254
+# Upper bin edges of the |value| -> E2M1 magnitude code mapping.
+_MXFP4_E2M1_THRESHOLDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+_MXFP4_BLOCK_SIZE = 32
+
+# Some vLLM builds (e.g. ROCm, or the ``RoutedExperts`` refactor on the
+# DeepSeek-V4 path) export ``FusedMoE`` as a factory function rather than a
+# class, which makes ``isinstance(module, FusedMoE)`` raise ``TypeError``. Fall
+# back to a sentinel type nothing is an instance of so those checks safely
+# evaluate to ``False``, and recognise the nested ``RoutedExperts`` submodule
+# that owns the expert weights / ``quant_method`` in that architecture.
+# ``vllm_fp8_utils`` imports ``FusedMoE`` / ``_is_fused_moe_expert_module`` from
+# here (no reverse dependency, so no circular import).
+if not isinstance(FusedMoE, type):
+
+    class _UnavailableFusedMoE:
+        pass
+
+    FusedMoE = _UnavailableFusedMoE
+
+try:
+    from vllm.model_executor.layers.fused_moe.routed_experts import (
+        RoutedExperts as _RoutedExperts,
+    )
+except Exception:  # pragma: no cover - older vLLM without RoutedExperts
+    _RoutedExperts = None
+
+if not isinstance(_RoutedExperts, type):
+    _RoutedExperts = None
+
+
+def _is_fused_moe_expert_module(module):
+    """Whether ``module`` is a vLLM fused-MoE expert container.
+
+    Handles both the legacy ``FusedMoE`` class and the newer ``RoutedExperts``
+    submodule that owns the expert weights / ``quant_method`` after vLLM turned
+    ``FusedMoE`` into a factory function (e.g. the DeepSeek-V4 path).
+    """
+    if isinstance(module, FusedMoE):
+        return True
+    if _RoutedExperts is not None and isinstance(module, _RoutedExperts):
+        return True
+    return False
+
 
 def is_deepseek_v4_model(model):
     if model is None:
@@ -32,23 +80,102 @@ def is_deepseek_v4_model(model):
     return getattr(text_config, "model_type", None) == "deepseek_v4"
 
 
+def _mxfp4_scale_to_e8m0(scale):
+    scale = scale.to(torch.float32)
+    safe_scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+    scale_exp = torch.ceil(torch.log2(safe_scale)).to(torch.int32) + _MXFP4_E8M0_BIAS
+    return scale_exp.clamp(_MXFP4_E8M0_MIN, _MXFP4_E8M0_MAX).to(torch.uint8)
+
+
+def quantize_mxfp4_weight(weight, dtype=torch.bfloat16):
+    """Blockwise-quantize a bf16/fp16 weight to packed MXFP4.
+
+    Returns ``(quant_weight, quant_scale)`` where ``quant_weight`` packs two 4-bit
+    E2M1 codes per uint8 (halving the last dim) and ``quant_scale`` holds one
+    E8M0 exponent (uint8) per 32-element block along the last dim.
+    """
+    target_dtype = dtype if dtype in (torch.bfloat16, torch.float16) else torch.bfloat16
+    weight = weight.to(target_dtype).contiguous()
+    *prefix_shape, hidden_dim = weight.shape
+    if hidden_dim % _MXFP4_BLOCK_SIZE != 0:
+        raise ValueError(f"MXFP4 weight hidden dimension must be divisible by 32, got shape={tuple(weight.shape)}")
+
+    num_blocks = hidden_dim // _MXFP4_BLOCK_SIZE
+    blocks = weight.reshape(-1, num_blocks, _MXFP4_BLOCK_SIZE).to(torch.float32)
+
+    amax = blocks.abs().amax(dim=-1)
+    quant_scale = _mxfp4_scale_to_e8m0(amax / _MXFP4_E2M1_MAX)
+    scale = torch.exp2((quant_scale.to(torch.float32) - _MXFP4_E8M0_BIAS).unsqueeze(-1))
+
+    scaled = (blocks / scale).clamp(-_MXFP4_E2M1_MAX, _MXFP4_E2M1_MAX)
+    thresholds = torch.tensor(_MXFP4_E2M1_THRESHOLDS, dtype=torch.float32, device=weight.device)
+    magnitude = torch.bucketize(scaled.abs(), thresholds).to(torch.uint8)
+    sign = torch.where(scaled < 0, torch.full_like(magnitude, 8), torch.zeros_like(magnitude))
+    codes = magnitude | sign
+
+    quant_weight = codes[..., 0::2] | (codes[..., 1::2] * 16)
+    quant_weight = quant_weight.view(*prefix_shape, hidden_dim // 2)
+    quant_scale = quant_scale.view(*prefix_shape, num_blocks)
+    return quant_weight, quant_scale
+
+
+def _is_routed_expert_weight_name(name):
+    # Routed experts are named ``...experts.<id>.w{1,2,3}.weight``; shared
+    # experts (``...shared_experts...``) stay FP8 and must be left untouched.
+    return ".experts." in name and ".shared_experts." not in name and name.endswith(".weight")
+
+
 def iter_deepseek_v4_weights(weights):
+    """Prepare DeepSeek-V4 weights coming from the trainer for vLLM loading.
+
+    Routed-expert weights are MXFP4 in the vLLM model. When the trainer exports
+    them already quantized (int8 / e8m0) we only need a dtype view; when they
+    arrive as bf16/fp16 (e.g. a Megatron path that does not quantize experts on
+    export) we must quantize them to packed MXFP4 on the fly, or the unpacked
+    hidden dim (e.g. 4096) will not fit the packed vLLM slot (2048).
+    """
     for name, weight in weights:
         if ".experts." in name and weight.dtype in (torch.int8, torch.float8_e8m0fnu):
-            weight = weight.view(torch.uint8)
+            yield name, weight.view(torch.uint8)
+            continue
+
+        if _is_routed_expert_weight_name(name) and weight.dtype in (torch.bfloat16, torch.float16):
+            quant_weight, quant_scale = quantize_mxfp4_weight(weight)
+            # vLLM's DeepSeek-V4 weights mapper turns ``.w{1,2,3}.scale`` into the
+            # matching ``.w{1,2,3}.weight_scale`` MXFP4 scale param.
+            scale_name = name[: -len(".weight")] + ".scale"
+            yield name, quant_weight
+            yield scale_name, quant_scale
+            continue
+
         yield name, weight
 
 
 def _is_mega_moe_module(module):
-    from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
+    try:
+        from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
+    except Exception:
+        return False
 
     return isinstance(module, DeepseekV4MegaMoEExperts)
 
 
 def _is_mxfp4_fused_moe_module(module):
-    from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+    """Detect an mxfp4-quantized fused-MoE module across vLLM versions.
 
-    return isinstance(module, FusedMoE) and isinstance(module.quant_method, Mxfp4MoEMethod)
+    Older vLLM held the mxfp4 quant method on the ``FusedMoE`` module directly;
+    vLLM >=0.25 turned ``FusedMoE`` into a factory function returning a
+    ``MoERunner`` whose expert weights + ``quant_method`` live on a child
+    ``RoutedExperts`` module. Keying off ``quant_method`` being an
+    ``Mxfp4MoEMethod`` works for both layouts (and avoids the
+    ``isinstance(module, FusedMoE)`` crash when ``FusedMoE`` is a function).
+    """
+    try:
+        from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+    except Exception:
+        return False
+
+    return isinstance(getattr(module, "quant_method", None), Mxfp4MoEMethod)
 
 
 def _make_mxfp4_moe_param(shape, device, weight_loader, quant_method=None):
@@ -107,6 +234,32 @@ def _try_load_column_weight(param, loaded_weight):
     return False
 
 
+def _try_load_row_weight(param, loaded_weight):
+    """Load a full row-parallel tensor into this rank's input-dimension shard."""
+    data = param.data
+    if data.shape == loaded_weight.shape:
+        _copy_loaded_weight(param, loaded_weight)
+        return True
+
+    if data.ndim != loaded_weight.ndim or data.ndim == 0:
+        return False
+
+    input_dim = _normalize_dim(
+        int(getattr(param, "input_dim", getattr(param, "_input_dim", data.ndim - 1))),
+        data.ndim,
+    )
+    tp_size = int(getattr(param, "tp_size", 1))
+    tp_rank = int(getattr(param, "tp_rank", 0))
+    expected_shape = list(data.shape)
+    expected_shape[input_dim] *= tp_size
+    if loaded_weight.shape != torch.Size(expected_shape):
+        return False
+
+    shard = loaded_weight.narrow(input_dim, tp_rank * data.shape[input_dim], data.shape[input_dim])
+    _copy_loaded_weight(param, shard)
+    return True
+
+
 def _try_load_merged_weight(param, loaded_weight, shard_offset, shard_size, shard_id):
     output_dim = int(getattr(param, "output_dim", getattr(param, "_output_dim", 0)))
     loaded_dim = loaded_weight.shape[output_dim]
@@ -147,6 +300,17 @@ def _attach_weight_loaders(param):
             return original_column_loader(self, *args, **kwargs)
 
         param.load_column_parallel_weight = MethodType(load_column_parallel_weight, param)
+
+    original_row_loader = getattr(subclass_type, "load_row_parallel_weight", None)
+    if original_row_loader is not None:
+
+        def load_row_parallel_weight(self, *args, **kwargs):
+            loaded_weight = kwargs.get("loaded_weight", args[0] if args else None)
+            if loaded_weight is not None and _try_load_row_weight(self, loaded_weight):
+                return
+            return original_row_loader(self, *args, **kwargs)
+
+        param.load_row_parallel_weight = MethodType(load_row_parallel_weight, param)
 
     original_merged_loader = getattr(subclass_type, "load_merged_column_weight", None)
     if original_merged_loader is not None:
@@ -216,35 +380,66 @@ def _restore_moe_params_for_loading(model):
             intermediate_size = module.intermediate_size
             hidden_size = module.hidden_size
             device = module._transformed_l1_weights[0].device
-        elif _is_mxfp4_fused_moe_module(module):
-            quant_method = module.quant_method
-            num_experts = quant_method.num_experts
-            intermediate_size = quant_method.intermediate_size
-            hidden_size = quant_method.hidden_size
-            device = module.w13_weight.device
-        else:
-            continue
 
-        weight_loader = module.weight_loader
-        module.w13_weight = _make_mxfp4_moe_param(
-            (num_experts, 2 * intermediate_size, hidden_size // 2), device, weight_loader
-        )
-        module.w2_weight = _make_mxfp4_moe_param(
-            (num_experts, hidden_size, intermediate_size // 2), device, weight_loader
-        )
-        module.w13_weight_scale = _make_mxfp4_moe_param(
-            (num_experts, 2 * intermediate_size, hidden_size // 32),
-            device,
-            weight_loader,
-            quant_method="block",
-        )
-        module.w2_weight_scale = _make_mxfp4_moe_param(
-            (num_experts, hidden_size, intermediate_size // 32),
-            device,
-            weight_loader,
-            quant_method="block",
-        )
-        restored = True
+            weight_loader = module.weight_loader
+            module.w13_weight = _make_mxfp4_moe_param(
+                (num_experts, 2 * intermediate_size, hidden_size // 2), device, weight_loader
+            )
+            module.w2_weight = _make_mxfp4_moe_param(
+                (num_experts, hidden_size, intermediate_size // 2), device, weight_loader
+            )
+            module.w13_weight_scale = _make_mxfp4_moe_param(
+                (num_experts, 2 * intermediate_size, hidden_size // 32),
+                device,
+                weight_loader,
+                quant_method="block",
+            )
+            module.w2_weight_scale = _make_mxfp4_moe_param(
+                (num_experts, hidden_size, intermediate_size // 32),
+                device,
+                weight_loader,
+                quant_method="block",
+            )
+            restored = True
+        elif _is_mxfp4_fused_moe_module(module):
+            # vLLM stores mxfp4 experts as packed 4-bit params; the actor exports
+            # bf16 experts that verl re-quantizes to mxfp4 with **block-32**
+            # scales. Rebuild the expert params as raw ``uint8`` buffers whose
+            # shapes match verl's re-quantized output (weights packed 2 fp4/byte
+            # along the hidden dim, scales at ``dim//32``) so vLLM's expert
+            # weight_loader copies them straight in.
+            #
+            # Derive dims from the *non-packed* param dimensions so this is robust
+            # to the ``FusedMoE`` -> ``MoERunner``/``RoutedExperts`` refactor
+            # (older code read them off quant_method, which moved):
+            #   w13_weight: (num_experts, 2*intermediate, hidden//2)
+            #   w2_weight:  (num_experts, hidden,          intermediate//2)
+            w13 = module.w13_weight
+            w2 = module.w2_weight
+            num_experts = w13.shape[0]
+            intermediate_size = w13.shape[1] // 2
+            hidden_size = w2.shape[1]
+            device = w13.device
+            weight_loader = _get_param_weight_loader(w13) or getattr(module, "weight_loader", None)
+            module.w13_weight = _make_mxfp4_moe_param(
+                (num_experts, 2 * intermediate_size, hidden_size // 2), device, weight_loader
+            )
+            module.w2_weight = _make_mxfp4_moe_param(
+                (num_experts, hidden_size, intermediate_size // 2), device, weight_loader
+            )
+            module.w13_weight_scale = _make_mxfp4_moe_param(
+                (num_experts, 2 * intermediate_size, hidden_size // 32),
+                device,
+                weight_loader,
+                quant_method="block",
+            )
+            module.w2_weight_scale = _make_mxfp4_moe_param(
+                (num_experts, hidden_size, intermediate_size // 32),
+                device,
+                weight_loader,
+                quant_method="block",
+            )
+            restored = True
     return restored
 
 
