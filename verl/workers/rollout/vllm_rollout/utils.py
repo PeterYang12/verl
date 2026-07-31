@@ -27,6 +27,7 @@ from vllm.outputs import RequestOutput
 
 from verl.plugin.platform import get_platform
 from verl.utils.device import is_npu_available
+from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
@@ -326,6 +327,14 @@ class vLLMColocateWorkerExtension:
 
             for model, model_config in self._iter_all_models_with_config():
                 process_weights_after_loading(model, model_config, self.device)
+
+        # The post-load transforms above rebuild quantized weights (e.g. the MXFP4
+        # expert slots for DeepSeek-V4), which allocates and then drops tens of GB of
+        # large blocks. Those blocks stay in this process' caching allocator, while the
+        # caller's next step is wake_up(tags=["kv_cache"]), which needs *physical* device
+        # memory from the driver and cannot reuse them. The receiver's own empty_cache()
+        # runs before these transforms, so release here too.
+        aggressive_empty_cache(force_sync=True)
 
     def _apply_buffer_updates_all_models(self, buffer_updates, main_named_buffers):
         """Apply buffer updates to the main model and any synced MTP drafter.
