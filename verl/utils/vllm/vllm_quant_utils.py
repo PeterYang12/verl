@@ -253,6 +253,31 @@ def apply_mxfp8_transformation_after_loading(model):
                 module.quant_method.process_weights_after_loading(module)
 
 
+def clear_rocm_attention_weight_caches(model):
+    """Drop the bf16 ``wo_a`` copy vLLM derives from the loaded weight.
+
+    ``rocm_aiter_mla_sparse._get_cached_wo_a_bf16`` dequantizes ``wo_a`` once and
+    parks the result on the module, on the premise that the weight is static.
+    A refit breaks that premise: the parameter and its block scale are updated,
+    but the cache is not, so attention keeps projecting with the previous step's
+    weight -- and on the first refit, with whatever the dummy warmup cached.
+
+    Runs before the reload rather than after it: the rebuild is lazy, deferred to
+    the next forward, so dropping the copies up front also returns their memory
+    for the duration of the transfer.
+
+    Called for every refit regardless of quantization scheme: vLLM builds this
+    cache from a plain bf16 ``wo_a`` too, so keying it off the fp8 post-load path
+    would miss unquantized DeepSeek-V4 checkpoints.
+
+    Only ROCm DeepSeek-V4 sets the attribute, so the walk is a no-op elsewhere
+    and needs no platform check.
+    """
+    for module in model.modules():
+        if hasattr(module, "_dsv4_wo_a_bf16"):
+            del module._dsv4_wo_a_bf16
+
+
 def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
     """Quantize weights to FP8 format using a memory-efficient generator.
 
@@ -330,6 +355,7 @@ def prepare_quanted_weights_for_loading(model):
 
 def process_quanted_weights_after_loading(model, reload_state):
     """Re-apply the inference layout undone by ``prepare_quanted_weights_for_loading``."""
+    clear_rocm_attention_weight_caches(model)
     apply_mxfp8_transformation_after_loading(model)
     reload_state = reload_state or {}
     process_fp8_weights_after_loading(reload_state.get("fp8_layers") or [])
