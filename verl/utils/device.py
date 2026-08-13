@@ -139,6 +139,13 @@ def set_expandable_segments(enable: bool) -> None:
     Args:
         enable: If True, enable expandable segments. If False, disable them.
     """
+    # On ROCm 7.2 / torch 2.11 an expandable segment is only handed back to the driver once
+    # it is completely empty: a single surviving allocation pins every page under it, and
+    # empty_cache() cannot release them. A trainer always keeps weights and optimizer state
+    # resident, so its whole peak stays on the card and vLLM's KV cache allocation fails on
+    # the next step. Allow opting out entirely until that is fixed upstream.
+    if enable and os.environ.get("VERL_DISABLE_EXPANDABLE_SEGMENTS") == "1":
+        enable = False
     get_platform().set_allocator_settings(f"expandable_segments:{enable}")
 
 
