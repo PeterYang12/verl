@@ -127,7 +127,9 @@ class AgentLoopOutput(BaseModel):
 
         routed_experts = output.pop("routed_experts", None)
         if routed_experts is not None:
-            routed_experts = torch.tensor(routed_experts, dtype=torch.int64)
+            # Expert ids fit in int16, and a batch carries num_tokens x num_layers x topk
+            # of them per sample, so the narrow dtype keeps the transfer cost down.
+            routed_experts = torch.tensor(routed_experts, dtype=torch.int16)
             # Router replay indexes this field by absolute token position, so it must
             # span the whole sequence. The rollout engine records fewer rows than that:
             # it only sees tokens fed through the model, and multi-turn loops stop
@@ -806,7 +808,7 @@ class AgentLoopWorker:
                 experts_tensor = output.routed_experts
             else:
                 raise TypeError(f"Unsupported type for routed_experts: {type(output.routed_experts)}")
-            routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype)
+            routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=torch.int16)
 
             # Calculate start position: left padding means original prompt starts at the end
             start_pos = prompt_output["input_ids"].shape[1] - len(output.prompt_ids)

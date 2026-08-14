@@ -401,6 +401,17 @@ class vLLMHttpServer:
                     f"(installed: {vllm.__version__}). Upgrade vLLM (e.g. `pip install -U "
                     "'vllm>=0.22.0'`) or disable enable_rollout_routing_replay."
                 )
+            from verl.trainer.ppo.metric_utils import infer_rollout_moe_num_experts
+
+            # AgentLoopOutput.as_dict stores route ids as int16 to keep them cheap to ship;
+            # ids beyond that would wrap silently and replay the wrong experts.
+            num_experts = infer_rollout_moe_num_experts(self.model_config)
+            if num_experts is not None and num_experts > 32768:
+                raise RuntimeError(
+                    "rollout.enable_rollout_routing_replay=True stores route ids as int16, which "
+                    f"cannot represent the {num_experts} experts of this model. Widen the "
+                    "routed_experts dtype in verl/experimental/agent_loop/agent_loop.py."
+                )
             args.update({"enable_return_routed_experts": True})
 
         if self._disaggregation_role != "null":
