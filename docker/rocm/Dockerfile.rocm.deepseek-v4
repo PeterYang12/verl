@@ -38,7 +38,7 @@ RUN pip install "transformers==5.12.1"  "TransferQueue==0.1.8"
 
 RUN cd /usr/local/lib/python3.12/dist-packages && \ 
     patch -p1 < /opt/patches/vllm-dsv4-rocm-sparse-topk-guard.patch && \
-    patch -p1 < /opt/patches/vllm-dsv4-rocm-sparse-topk-guard.patch && \
+    patch -p1 < /opt/patches/vllm-cumem-wake-empty-cache.patch && \
     cd /app
 
 ARG BUILD_DATE="2026-08-18"
