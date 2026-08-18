@@ -92,6 +92,92 @@ def apply_fast_hadamard_transform_shim():
     )
 
 
+def apply_patch_csa_unfused_sparse_attn():
+    """Keep the unfused DSA sparse-attention backward from allocating a T^2 buffer.
+
+    ``csa.unfused_compressed_sparse_attn`` selects the top-k KV rows with
+    ``torch.gather(kv_flat.unsqueeze(0).expand(rows, -1, -1), dim=1, index=...)``. The forward
+    is free (the expand is a view), but ``gather``'s backward is
+    ``new_zeros(input.sizes()).scatter_add_(...)``, so it materialises the whole expanded
+    ``(rows, n_kv, hn)`` shape -- quadratic in sequence length. At 6k packed tokens that is one
+    84 GiB block per layer, which a 252 GiB card cannot serve while a colocated rollout engine
+    holds its share, and which only succeeds at all because expandable segments can stitch it
+    out of scattered pages.
+
+    Indexing the ``(n_kv, hn)`` table directly yields the same values -- both forms read
+    ``kv_flat[safe_indices[i, k], h]`` -- and the same gradient, since ``index_select``
+    accumulates into the real table exactly like ``scatter_add`` followed by the expand's
+    sum-over-broadcast-dim. Only the intermediate disappears.
+
+    The fused kernels never reach this path, but ``apply_dsa_kernel_fusion=True`` needs
+    ``flash_mla`` plus cuDNN CuTe-DSL, neither of which builds on ROCm, so ROCm always lands
+    here. Upstream flags the function as reference-only ("the performance and the memory
+    footprint of it is not good for the real scenario").
+    """
+    import torch
+
+    try:
+        from megatron.core.transformer.experimental_attention_variant import csa
+    except ImportError:
+        return  # No DSA/CSA attention variant in this mcore: nothing to patch.
+
+    if getattr(csa, "_verl_unfused_sparse_attn_patched", False):
+        return
+
+    def unfused_compressed_sparse_attn(query, kv_full, attn_sink, topk_indices, softmax_scale):
+        is_thd = query.ndim == 3
+
+        if is_thd:
+            q_flat = query  # (rows, np, hn)
+            kv_flat = kv_full  # (n_kv, hn)
+            global_indices = topk_indices  # (rows, topk)
+        else:
+            sq, b, np_, hn = query.size()
+            n_kv = kv_full.size(0)
+            # b-major flatten of query and kv_full.
+            q_flat = query.permute(1, 0, 2, 3).reshape(b * sq, np_, hn)
+            kv_flat = kv_full.permute(1, 0, 2).reshape(b * n_kv, hn)
+            # Globalize topk_indices: ``global = batch_idx * n_kv + local``.
+            valid = topk_indices >= 0
+            batch_ids = torch.arange(b, device=query.device).view(b, 1, 1)
+            global_indices = torch.where(valid, topk_indices + batch_ids * n_kv, topk_indices).reshape(
+                b * sq, -1
+            )
+
+        rows, np_, hn = q_flat.shape
+
+        safe_indices = global_indices.clamp(min=0).long()
+        # The one line that differs from upstream: row-index the KV table instead of gathering
+        # along dim=1 of a (rows, n_kv, hn) broadcast view of it. See the docstring.
+        kv_gathered = kv_flat.index_select(0, safe_indices.reshape(-1)).view(rows, -1, hn)
+
+        q_f = q_flat.float()
+        kv_g = kv_gathered.float()
+        scores = torch.einsum("inh,ikh->ink", q_f, kv_g) * softmax_scale  # (rows, np, topk)
+
+        invalid_mask = (global_indices < 0).unsqueeze(1)  # (rows, 1, topk)
+        scores = scores.masked_fill(invalid_mask, float("-inf"))
+
+        sink = attn_sink.view(1, np_, 1).float()
+        scores_max = scores.max(dim=-1, keepdim=True).values
+        scores_max = torch.max(scores_max, sink)
+
+        exp_scores = torch.exp(scores - scores_max)
+        exp_sink = torch.exp(sink - scores_max)
+        attn_weights = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
+
+        output = torch.einsum("ink,ikh->inh", attn_weights, kv_g)
+        output = output.to(query.dtype)
+
+        if is_thd:
+            return output.reshape(rows, np_ * hn)
+        return output.reshape(b, sq, np_ * hn).permute(1, 0, 2).contiguous()
+
+    unfused_compressed_sparse_attn.__doc__ = csa.unfused_compressed_sparse_attn.__doc__
+    csa.unfused_compressed_sparse_attn = unfused_compressed_sparse_attn
+    csa._verl_unfused_sparse_attn_patched = True
+
+
 def apply_patch():
     # DeepSeek sparse-attention (DSA) needs ``fast_hadamard_transform``, which
     # cannot be built on ROCm (its setup requires nvcc). Install a pure-torch
@@ -100,6 +186,7 @@ def apply_patch():
     # creation (hf_to_mcore_config_dpskv3) and after it (the mbridge path in
     # megatron_utils.get_model), which is why the shim also back-fills importers.
     apply_fast_hadamard_transform_shim()
+    apply_patch_csa_unfused_sparse_attn()
 
     import megatron.core
     import torch
