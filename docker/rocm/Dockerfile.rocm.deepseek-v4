@@ -36,9 +36,14 @@ RUN pip install --no-deps --no-build-isolation --ignore-requires-python \
 
 RUN pip install "transformers==5.12.1"  "TransferQueue==0.1.8"
 
-ARG BUILD_DATE="2026-08-07"
+RUN cd /usr/local/lib/python3.12/dist-packages && \ 
+    patch -p1 < /opt/patches/vllm-dsv4-rocm-sparse-topk-guard.patch && \
+    patch -p1 < /opt/patches/vllm-dsv4-rocm-sparse-topk-guard.patch && \
+    cd /app
+
+ARG BUILD_DATE="2026-08-18"
 RUN --mount=type=cache,target=/root/.cache/pip \
-    git clone https://github.com/verl-project/verl.git && \
+    git clone -b bug-fix-0818 https://github.com/PeterYang12/verl.git && \
     cd verl && \
     pip install -e .
 
