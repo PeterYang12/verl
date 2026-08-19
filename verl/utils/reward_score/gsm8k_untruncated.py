@@ -12,17 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GSM8K scoring for base checkpoints that answer correctly and then keep generating.
+"""GSM8K strict scoring without the 300-character tail window.
 
-:mod:`verl.utils.reward_score.gsm8k` reads only the last 300 characters and only accepts
-``#### N``. Both assumptions hold for a post-trained model, and both break on a raw
-pretrained checkpoint, which answers early, uses ``\\boxed{}`` about as often as ``####``,
-and then continues with unrelated text that fills the tail window.
+:mod:`verl.utils.reward_score.gsm8k` clips to the last 300 characters before matching,
+which its own comment describes as a speed optimization on the assumption that "the final
+answer is usually at the end". That holds for a post-trained model but not for a raw
+pretrained one, which emits a well-formed ``#### N`` early and then keeps generating
+unrelated text until the answer sits outside the window and scores zero.
 
-Measured on DeepSeek-V4-Flash-Base with an unmodified prompt and rollout (60 prompts x 8
-rollouts, temperature 1.0, ``enable_thinking=False``): the default scorer saw 2.3% correct
-and left only 16.7% of GRPO groups with any reward variance, while these rules saw 50.4%
-and 96.7%.
+Dropping the clip cannot lower a score: the window is a suffix, so any match inside it is
+also the last match of the full string. It only turns an undeserved 0 into a 1.
+
+The ``#### N`` requirement is kept deliberately. The gsm8k prompt built by
+``examples/data_preprocess/gsm8k.py`` instructs the model to "output the final answer
+after '####'", so accepting ``\\boxed{}`` here would reward ignoring that instruction.
+Measured on DeepSeek-V4-Flash-Base (60 prompts x 8 rollouts, temperature 1.0,
+``enable_thinking=False``), keeping the format requirement and only dropping the clip
+already lifts GRPO groups that carry reward variance from 16.7% to 95.0%; also accepting
+``\\boxed{}`` would raise accuracy further but move that figure only to 96.7%.
 
 Wire it up with::
 
@@ -32,8 +39,7 @@ Wire it up with::
 
 import re
 
-_HASH_ANSWER = re.compile(r"#### (\-?[0-9\.\,]+)")
-_BOXED_ANSWER = re.compile(r"\\boxed\{([^}]*)\}")
+_STRICT_ANSWER = re.compile(r"#### (\-?[0-9\.\,]+)")
 
 
 def _normalize(value):
@@ -41,12 +47,9 @@ def _normalize(value):
 
 
 def extract_solution(solution_str):
-    """Return the model's final answer, searching the whole response in either format."""
-    for pattern in (_HASH_ANSWER, _BOXED_ANSWER):
-        matches = pattern.findall(solution_str)
-        if matches:
-            return _normalize(matches[-1])
-    return None
+    """Return the last ``#### N`` in the response, searching all of it."""
+    matches = _STRICT_ANSWER.findall(solution_str)
+    return _normalize(matches[-1]) if matches else None
 
 
 def compute_score(data_source=None, solution_str="", ground_truth="", extra_info=None, **kwargs):
