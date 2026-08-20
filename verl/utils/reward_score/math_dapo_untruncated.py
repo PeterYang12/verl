@@ -70,7 +70,10 @@ and, to also take the first match::
 
 import re
 
-from .math_dapo import last_boxed_only_string, normalize_final_answer, remove_boxed
+# Absolute rather than relative: verl's ``file://``/plain-path loader builds the module with
+# ``spec_from_file_location`` under a synthetic name, leaving it without a parent package, so a
+# relative import would fail there and only work via ``pkg://``.
+from verl.utils.reward_score.math_dapo import last_boxed_only_string, normalize_final_answer, remove_boxed
 
 _ANSWER_PATTERN = re.compile(r"(?i)Answer\s*:\s*([^\n]+)")
 _BOXED = "\\boxed{"
