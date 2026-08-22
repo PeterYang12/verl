@@ -92,15 +92,8 @@ def apply_fast_hadamard_transform_shim():
     )
 
 
-def _unfused_csa_chunk_rows() -> int:
-    """Row-block size for the unfused DSA attention; ``0`` disables blocking."""
-    import os
-
-    return int(os.environ.get("VERL_CSA_UNFUSED_CHUNK_ROWS", "1024")) or (1 << 62)
-
-
 def apply_patch_csa_unfused_sparse_attn():
-    """Keep the unfused DSA sparse-attention off a (rows, n_kv, hn) and a whole-batch buffer.
+    """Keep the unfused DSA sparse-attention backward from allocating a T^2 buffer.
 
     ``csa.unfused_compressed_sparse_attn`` selects the top-k KV rows with
     ``torch.gather(kv_flat.unsqueeze(0).expand(rows, -1, -1), dim=1, index=...)``. The forward
@@ -116,21 +109,12 @@ def apply_patch_csa_unfused_sparse_attn():
     accumulates into the real table exactly like ``scatter_add`` followed by the expand's
     sum-over-broadcast-dim. Only the intermediate disappears.
 
-    What is left after that still scales with the packed batch: the gathered
-    ``(rows, topk, hn)`` KV table, upcast to fp32, is one 20 GiB block at 10k packed tokens,
-    and because it feeds both einsums it accrues *two* gradients of that size in backward.
-    Measured on a colocated 7-layer run, this path owned 68 GiB of the actor's 129 GiB peak.
-    Since those intermediates are separable over ``rows``, computing the attention in
-    checkpointed row blocks bounds them to one block without changing the arithmetic --
-    no dtype is lowered, so log-probs keep the reference path's precision.
-
     The fused kernels never reach this path, but ``apply_dsa_kernel_fusion=True`` needs
     ``flash_mla`` plus cuDNN CuTe-DSL, neither of which builds on ROCm, so ROCm always lands
     here. Upstream flags the function as reference-only ("the performance and the memory
     footprint of it is not good for the real scenario").
     """
     import torch
-    import torch.utils.checkpoint
 
     try:
         from megatron.core.transformer.experimental_attention_variant import csa
@@ -163,44 +147,26 @@ def apply_patch_csa_unfused_sparse_attn():
         rows, np_, hn = q_flat.shape
 
         safe_indices = global_indices.clamp(min=0).long()
+        # The one line that differs from upstream: row-index the KV table instead of gathering
+        # along dim=1 of a (rows, n_kv, hn) broadcast view of it. See the docstring.
+        kv_gathered = kv_flat.index_select(0, safe_indices.reshape(-1)).view(rows, -1, hn)
+
+        q_f = q_flat.float()
+        kv_g = kv_gathered.float()
+        scores = torch.einsum("inh,ikh->ink", q_f, kv_g) * softmax_scale  # (rows, np, topk)
+
+        invalid_mask = (global_indices < 0).unsqueeze(1)  # (rows, 1, topk)
+        scores = scores.masked_fill(invalid_mask, float("-inf"))
+
         sink = attn_sink.view(1, np_, 1).float()
-        # Upcast the (n_kv, hn) table, not the (rows, topk, hn) gather of it: one small fp32
-        # copy instead of a large one, and index_select's backward then accumulates the top-k
-        # hits in fp32 rather than rounding every one of them into a bf16 table.
-        kv_f = kv_flat.float()
+        scores_max = scores.max(dim=-1, keepdim=True).values
+        scores_max = torch.max(scores_max, sink)
 
-        def attend(kv_table, q_rows, idx_rows, invalid_rows):
-            # The one line that differs from upstream: row-index the KV table instead of
-            # gathering along dim=1 of a (rows, n_kv, hn) broadcast view of it. See the docstring.
-            kv_g = kv_table.index_select(0, idx_rows.reshape(-1)).view(idx_rows.shape[0], -1, hn)
-            scores = torch.einsum("inh,ikh->ink", q_rows.float(), kv_g) * softmax_scale
-            scores = scores.masked_fill(invalid_rows.unsqueeze(1), float("-inf"))
+        exp_scores = torch.exp(scores - scores_max)
+        exp_sink = torch.exp(sink - scores_max)
+        attn_weights = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
 
-            scores_max = torch.max(scores.max(dim=-1, keepdim=True).values, sink)
-            exp_scores = torch.exp(scores - scores_max)
-            exp_sink = torch.exp(sink - scores_max)
-            attn_weights = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
-
-            return torch.einsum("ink,ikh->inh", attn_weights, kv_g)
-
-        # Every (rows, topk, hn) intermediate above is ``rows``-separable: the softmax reduces
-        # over topk within one row, so a row block computes exactly what it would have as part
-        # of the full batch. Checkpoint each block so its kv_g -- and, in backward, the two
-        # gradients kv_g accrues from the score and output einsums -- live one block at a time
-        # instead of all at once.
-        step = _unfused_csa_chunk_rows()
-        if rows <= step:
-            output = attend(kv_f, q_flat, safe_indices, global_indices < 0)
-        else:
-            blocks = []
-            for start in range(0, rows, step):
-                stop = min(start + step, rows)
-                args = (kv_f, q_flat[start:stop], safe_indices[start:stop], global_indices[start:stop] < 0)
-                if torch.is_grad_enabled():
-                    blocks.append(torch.utils.checkpoint.checkpoint(attend, *args, use_reentrant=False))
-                else:
-                    blocks.append(attend(*args))
-            output = torch.cat(blocks, dim=0)
+        output = torch.einsum("ink,ikh->inh", attn_weights, kv_g)
         output = output.to(query.dtype)
 
         if is_thd:
