@@ -22,13 +22,13 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 PROJECT_NAME=${PROJECT_NAME:-debug_ROCM_DSV4_flash}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-0824_ds_base_fp8_dapo_500steps}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-30720}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-8192}
 PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}
 
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-10}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-500}
-SAVE_FREQ=${SAVE_FREQ:--1}
-TEST_FREQ=${TEST_FREQ:-5}
+SAVE_FREQ=${SAVE_FREQ:-20}
+TEST_FREQ=${TEST_FREQ:-10}
 
 NNODES=${NNODES:-4}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
@@ -54,7 +54,7 @@ MODEL_PATH=${MODEL_PATH:-/models/DeepSeek-V4-Flash-Base}
 TRAIN_FILE=${TRAIN_FILE:-/models/retool_dapo/train.parquet}
 TEST_FILE=${TEST_FILE:-/models/retool_aime2024/train.parquet}
 CKPTS_DIR=${CKPTS_DIR:-/models/verl-ds-data/${PROJECT_NAME}/${EXPERIMENT_NAME}}
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-128}
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-64}
 ROLLOUT_N=${ROLLOUT_N:-8}
 n_resp_per_prompt_val=16
@@ -64,7 +64,7 @@ ENABLE_THINKING=${ENABLE_THINKING:-True}
 ROLLOUT_TP=${ROLLOUT_TP:-1}
 ROLLOUT_DP=${ROLLOUT_DP:-8}
 ROLLOUT_EP=${ROLLOUT_EP:-8}
-ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.8}
+ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.7}
 ROLLOUT_MAX_MODEL_LEN=${ROLLOUT_MAX_MODEL_LEN:-${PPO_MAX_TOKEN_LEN_PER_GPU}}
 ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-${PPO_MAX_TOKEN_LEN_PER_GPU}}
 ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-64}
@@ -129,7 +129,7 @@ MODEL=(
 
 ACTOR=(
     actor_rollout_ref.actor.optim.lr=${ACTOR_LR}
-    actor_rollout_ref.actor.optim.lr_decay_style=cosine
+    actor_rollout_ref.actor.optim.lr_decay_style=constant
     actor_rollout_ref.actor.use_kl_loss=${USE_KL_LOSS}
     actor_rollout_ref.actor.kl_loss_coef=${KL_LOSS_COEF}
     actor_rollout_ref.actor.clip_ratio_low=${CLIP_RATIO_LOW}
@@ -226,7 +226,7 @@ TRAINER=(
     trainer.critic_warmup=${CRITIC_WARMUP}
     trainer.resume_mode=auto
     trainer.val_before_train=True
-    trainer.log_val_generations=0
+    trainer.log_val_generations=100
     trainer.default_local_dir="${CKPTS_DIR}"
 )
 
