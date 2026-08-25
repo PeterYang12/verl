@@ -794,12 +794,16 @@ class MegatronEngine(BaseEngine):
         origin_module_device = get_megatron_module_device(self.module)
         if self._is_offload_param or origin_module_device == "cpu":
             load_megatron_model_to_gpu(self.module, load_grad=True)
+        if self._is_offload_optimizer and self.optimizer is not None:
+            load_megatron_optimizer(self.optimizer)
         self.checkpoint_mananager.save_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
         )
         torch.distributed.barrier()
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.module)
+        if self._is_offload_optimizer and self.optimizer is not None:
+            offload_megatron_optimizer(self.optimizer)
 
     def load_checkpoint(
         self, local_path: str, hdfs_path: str | None = None, del_local_after_load: bool = True, **kwargs
@@ -814,12 +818,14 @@ class MegatronEngine(BaseEngine):
         """
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.module)
+        if self._is_offload_optimizer and self.optimizer is not None:
+            load_megatron_optimizer(self.optimizer)
         self.checkpoint_mananager.load_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
         )
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.module)
-        if self._is_offload_optimizer:
+        if self._is_offload_optimizer and self.optimizer is not None:
             offload_megatron_optimizer(self.optimizer)
 
     def _routed_num_tokens(self, data: TensorDict) -> torch.Tensor:
