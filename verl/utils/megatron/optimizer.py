@@ -218,15 +218,89 @@ def init_megatron_optim_config(
     return config
 
 
+def _realign_param_group_index_map(optimizer) -> None:
+    """Rebuild ``DistributedOptimizer.model_param_group_index_map`` from the inner optimizer.
+
+    Megatron records each model param's ``group_order`` in grad-buffer iteration order
+    (``_build_optimizer_group_ranges``), but hands the inner optimizer its params grouped by
+    dtype, fp32 shards ahead of the 16-bit ones (``_build_model_and_main_param_groups``). The
+    two orders only coincide while every param group is dtype-homogeneous. That stops holding
+    for models keeping part of the weights in fp32 under bf16 training: DeepSeek V4 marks its
+    mHC and sparse-attention params (``mapping_proj``, ``alpha_*``, ``bias``, ``ape``,
+    ``attn_sink``) with Megatron's ``mark_keep_in_fp32``, and ``_get_param_groups`` never
+    splits groups by dtype, so those land next to bf16 params.
+
+    Checkpoint save/load resolves optimizer state through that index
+    (``_get_main_param_and_optimizer_states``), so a stale index makes Megatron read another
+    param's shard: saving trips the shape assert in ``sharded_param_state_dp_reshardable``,
+    and loading would silently restore state onto the wrong params.
+
+    Deriving the index from the inner optimizer's actual layout is a no-op whenever the two
+    orders already agree.
+    """
+    # Duck-typed throughout: this runs on whatever Megatron build is installed, and only
+    # DistributedOptimizer instances carry the attributes below.
+    def _list_attr(obj, name):
+        value = getattr(obj, name, None)
+        return value if isinstance(value, list) else None
+
+    chained = _list_attr(optimizer, "chained_optimizers")
+    realigned = 0
+    for opt in [optimizer] if chained is None else chained:
+        index_map = getattr(opt, "model_param_group_index_map", None)
+        param_groups = _list_attr(getattr(opt, "optimizer", None), "param_groups")
+        if not isinstance(index_map, dict) or param_groups is None:
+            continue
+
+        if getattr(getattr(opt, "config", None), "use_precision_aware_optimizer_no_fp8_or_ds_fp8", False):
+            float16_shard_groups = _list_attr(opt, "shard_float16_groups")
+        else:
+            float16_shard_groups = _list_attr(opt, "shard_fp32_from_float16_groups")
+        fp32_shard_groups = _list_attr(opt, "shard_fp32_groups")
+        model_float16_groups = _list_attr(opt, "model_float16_groups")
+        model_fp32_groups = _list_attr(opt, "model_fp32_groups")
+        if None in (float16_shard_groups, fp32_shard_groups, model_float16_groups, model_fp32_groups):
+            continue
+
+        # Megatron keeps `None` placeholders for quantized params whose shard the inner
+        # optimizer owns itself; they carry no identity to match on, so leave them alone.
+        shard_to_index = {}
+        for group_index, group in enumerate(param_groups):
+            for group_order, shard in enumerate(group["params"]):
+                if shard is not None:
+                    shard_to_index[shard] = (group_index, group_order)
+
+        for model_groups, shard_groups in (
+            (model_float16_groups, float16_shard_groups),
+            (model_fp32_groups, fp32_shard_groups),
+        ):
+            for model_group, shard_group in zip(model_groups, shard_groups, strict=True):
+                for model_param, shard in zip(model_group, shard_group, strict=True):
+                    index = shard_to_index.get(shard) if shard is not None else None
+                    if index is None or index_map.get(model_param) == index:
+                        continue
+                    index_map[model_param] = index
+                    realigned += 1
+
+    if realigned:
+        print_rank_0(
+            f"Realigned {realigned} entries of model_param_group_index_map: this rank holds optimizer "
+            "param groups mixing fp32 and 16-bit params, whose grad-buffer order does not match the "
+            "order Megatron installs into the inner optimizer."
+        )
+
+
 def get_megatron_optimizer(
     model,
     config: OptimizerConfig,
 ):
     # Base optimizer.
-    return get_megatron_optimizer_native(
+    optimizer = get_megatron_optimizer_native(
         config=config,
         model_chunks=model,
     )
+    _realign_param_group_index_map(optimizer)
+    return optimizer
 
 
 def get_megatron_optimizer_param_scheduler(
