@@ -812,11 +812,19 @@ class MegatronEngine(BaseEngine):
             hdfs_path: Optional HDFS path where checkpoint is stored.
             del_local_after_load: Whether to delete local copy after loading.
         """
+        from verl.utils.megatron.optimizer import rebuild_hdo_sub_optimizers_after_load
+
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.module)
         self.checkpoint_mananager.load_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
         )
+        # Loading re-runs HybridDeviceOptimizer's `_init_sub_optimizers` from Megatron's
+        # load_state_dict hook, which partitions params by `param.is_cuda` -- and verl gets
+        # there with the optimizer offloaded. Redo it with the params back on the GPU.
+        if self.optimizer is not None:
+            load_megatron_optimizer(self.optimizer)
+            rebuild_hdo_sub_optimizers_after_load(self.optimizer)
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.module)
         if self._is_offload_optimizer:

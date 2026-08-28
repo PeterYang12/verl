@@ -29,6 +29,7 @@ TOTAL_EPOCHS=${TOTAL_EPOCHS:-10}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-500}
 SAVE_FREQ=${SAVE_FREQ:-20}
 TEST_FREQ=${TEST_FREQ:-10}
+MAX_ACTOR_CKPT_TO_KEEP=${MAX_ACTOR_CKPT_TO_KEEP:-1}
 
 NNODES=${NNODES:-4}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
@@ -221,6 +222,7 @@ TRAINER=(
     trainer.nnodes=${NNODES}
     trainer.save_freq=${SAVE_FREQ}
     trainer.test_freq=${TEST_FREQ}
+    trainer.max_actor_ckpt_to_keep=${MAX_ACTOR_CKPT_TO_KEEP}
     trainer.total_epochs=${TOTAL_EPOCHS}
     trainer.total_training_steps=${TOTAL_TRAINING_STEPS}
     trainer.critic_warmup=${CRITIC_WARMUP}

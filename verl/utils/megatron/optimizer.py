@@ -290,10 +290,151 @@ def _realign_param_group_index_map(optimizer) -> None:
         )
 
 
+def _hdo_master_param_is_duplicate(dist_opt) -> bool:
+    """True when the inner optimizer publishes a ``master_param`` that merely copies ``param``.
+
+    ``optimizer_cpu_offload=True`` makes Megatron build a ``HybridDeviceOptimizer`` with
+    ``param_update_in_fp32=True``, and its ``_sync_sub_optimizers_state_to_hdo`` publishes the
+    sub-optimizer's inner param as ``state[param]["master_param"]``. The DistributedOptimizer
+    only ever hands the inner optimizer fp32 shards, so that inner param is a pinned CPU copy
+    of ``param`` rather than a dtype upcast, and the HDO copies it back onto ``param`` after
+    every step. Under the precision-aware optimizer ``master_param`` is instead the optimizer's
+    own master weight, which is not recoverable from anything else.
+    """
+    if getattr(getattr(dist_opt, "config", None), "use_precision_aware_optimizer_no_fp8_or_ds_fp8", False):
+        return False
+    inner = getattr(dist_opt, "optimizer", None)
+    if not hasattr(inner, "sub_optimizers") or not getattr(inner, "param_update_in_fp32", False):
+        return False
+    # A non-empty param_to_fp32_param would mean the inner param is a real dtype upcast.
+    return not getattr(inner, "param_to_fp32_param", None)
+
+
+def _drop_duplicate_master_param(dist_opt, tensors: dict) -> dict:
+    """Keep the redundant ``master_param`` copy out of the optimizer's sharded state dict.
+
+    Persisting it costs a fourth fp32 copy of every parameter (~33% of the optimizer
+    checkpoint) and carries no information beyond ``param``.
+    """
+    if _hdo_master_param_is_duplicate(dist_opt):
+        tensors.pop("master_param", None)
+    return tensors
+
+
+def _restore_duplicate_master_param(dist_opt, tensors: dict) -> dict:
+    """Re-derive ``master_param`` from ``param`` when loading a checkpoint saved without it.
+
+    Checkpoints written before this dedup still carry ``master_param`` and are left alone.
+    """
+    if "master_param" in tensors or not _hdo_master_param_is_duplicate(dist_opt):
+        return tensors
+    return {**tensors, "master_param": tensors["param"]}
+
+
+def apply_hdo_master_param_dedup_patch() -> None:
+    """Stop round-tripping the HybridDeviceOptimizer's duplicate ``master_param`` through disk.
+
+    Both hooks must move together: ``_get_main_param_and_optimizer_states`` builds the sharded
+    state dict for saving *and* the request used when loading, while
+    ``_set_main_param_and_optimizer_states`` indexes the loaded tensors by the keys the live
+    optimizer state carries -- which still includes ``master_param``.
+
+    Note this changes the on-disk layout: checkpoints written with the dedup cannot be read by
+    an unpatched Megatron.
+    """
+    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+    if getattr(DistributedOptimizer, "_verl_master_param_dedup", False):
+        return
+
+    original_get = DistributedOptimizer._get_main_param_and_optimizer_states
+    original_set = DistributedOptimizer._set_main_param_and_optimizer_states
+
+    def _get_main_param_and_optimizer_states(self, model_param):
+        return _drop_duplicate_master_param(self, original_get(self, model_param))
+
+    def _set_main_param_and_optimizer_states(self, model_param, tensors):
+        return original_set(self, model_param, _restore_duplicate_master_param(self, tensors))
+
+    DistributedOptimizer._get_main_param_and_optimizer_states = _get_main_param_and_optimizer_states
+    DistributedOptimizer._set_main_param_and_optimizer_states = _set_main_param_and_optimizer_states
+    DistributedOptimizer._verl_master_param_dedup = True
+
+
+def _sync_fp32_params_from_state(hdo) -> None:
+    """Drop-in for ``HybridDeviceOptimizer._update_fp32_params_by_new_state``.
+
+    Upstream indexes ``param_to_fp32_param[param]`` for every entry of ``self.state``, but that
+    map only holds params the HDO actually had to upcast (``param.dtype != torch.float32``).
+    ``DistributedOptimizer`` hands the inner optimizer fp32 shards exclusively, so the map stays
+    empty while ``param_update_in_fp32`` is hardcoded ``True`` for the CPU-offload path. Worse,
+    the caller ``_sync_hdo_state_to_sub_optimizers`` reads ``self.state[orig_param]`` off a
+    ``defaultdict(dict)``, which inserts an empty entry for *every* param first -- so the
+    unguarded lookup raises ``KeyError`` on any ``load_state_dict``, i.e. on every resume.
+
+    Params with no fp32 counterpart need no sync: their inner param is the pinned CPU copy that
+    ``_move_new_state_to_right_device`` and ``_init_sub_optimizers`` already maintain.
+    """
+    if not hdo.param_update_in_fp32:
+        return
+    for param, state in hdo.state.items():
+        fp32_param = hdo.param_to_fp32_param.get(param)
+        if fp32_param is None or "master_param" not in state:
+            continue
+        fp32_param.data.copy_(state["master_param"])
+
+
+def apply_hdo_fp32_param_sync_patch() -> None:
+    """Make the HybridDeviceOptimizer's fp32 sync tolerate params that were never upcast."""
+    from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
+
+    if getattr(HybridDeviceOptimizer, "_verl_fp32_param_sync_guard", False):
+        return
+
+    HybridDeviceOptimizer._update_fp32_params_by_new_state = _sync_fp32_params_from_state
+    HybridDeviceOptimizer._verl_fp32_param_sync_guard = True
+
+
+def _iter_hybrid_device_optimizers(optimizer):
+    """Yield every HybridDeviceOptimizer reachable from a (possibly chained) Megatron optimizer."""
+    chained = getattr(optimizer, "chained_optimizers", None)
+    for opt in [optimizer] if chained is None else chained:
+        inner = getattr(opt, "optimizer", None)
+        if hasattr(inner, "sub_optimizers") and hasattr(inner, "gpu_params_map_cpu_copy"):
+            yield inner
+
+
+@torch.no_grad()
+def rebuild_hdo_sub_optimizers_after_load(optimizer) -> None:
+    """Rebuild a HybridDeviceOptimizer's device partition once a checkpoint load has finished.
+
+    ``_init_sub_optimizers`` splits params by ``param.is_cuda`` and gives every CUDA param a
+    pinned CPU copy; params already on CPU are handed to the CPU sub-optimizers *directly*,
+    with no entry in ``cpu_copys_map_gpu_param``. Megatron re-runs it from the
+    ``load_state_dict`` post-hook, which verl reaches while the optimizer may still be
+    offloaded, so the partition comes back degenerate and the next ``step()`` dies looking up
+    the missing copy.
+
+    Redoing it here -- after the load, with the params pulled back onto the GPU -- restores a
+    consistent partition no matter what device they were on mid-load, and re-derives the CPU
+    copies from the values the checkpoint just restored. ``_sync_hdo_state_to_sub_optimizers``
+    reinstalls the loaded moments into the freshly built sub-optimizers.
+
+    A no-op for optimizers that aren't CPU-offloaded.
+    """
+    for hdo in _iter_hybrid_device_optimizers(optimizer):
+        hdo._init_sub_optimizers()
+        hdo._sync_hdo_param_groups_to_sub_optimizers()
+        hdo._sync_hdo_state_to_sub_optimizers()
+
+
 def get_megatron_optimizer(
     model,
     config: OptimizerConfig,
 ):
+    if getattr(config, "optimizer_cpu_offload", False):
+        apply_hdo_master_param_dedup_patch()
+        apply_hdo_fp32_param_sync_patch()
     # Base optimizer.
     optimizer = get_megatron_optimizer_native(
         config=config,
