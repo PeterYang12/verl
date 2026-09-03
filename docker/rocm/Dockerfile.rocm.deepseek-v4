@@ -9,6 +9,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 RUN pip install --no-build-isolation  https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.3/transformer_engine_torch-2.6.0.tar.gz
 
+# ROCM7.2.x driver will not return memory when large torch tensor allocated and turn 'expandable_segments:True' on
+# This issue has been fixed in higher ROCM version, so self build a libhsa-runtime to bypass OOM issue 
+RUN wget https://github.com/PeterYang12/Daily_LLM/releases/download/v0.0.1/libhsa-runtime64.so.1.18.0 && \
+    install -m 0644 /app/libhsa-runtime64.so.1.18.0  /opt/rocm-7.2.3/lib/libhsa-runtime64.so.1.18.70203
+
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -U git+https://github.com/ISEEKYAN/mbridge.git@v0.15.1 && \
     pip install mathruler && \
@@ -36,9 +41,14 @@ RUN pip install --no-deps --no-build-isolation --ignore-requires-python \
 
 RUN pip install "transformers==5.12.1"  "TransferQueue==0.1.8"
 
-ARG BUILD_DATE="2026-08-07"
+RUN cd /usr/local/lib/python3.12/dist-packages && \ 
+    patch -p1 < /opt/patches/vllm-dsv4-rocm-sparse-topk-guard.patch && \
+    patch -p1 < /opt/patches/vllm-cumem-wake-empty-cache.patch && \
+    cd /app
+
+ARG BUILD_DATE="2026-09-03"
 RUN --mount=type=cache,target=/root/.cache/pip \
-    git clone https://github.com/verl-project/verl.git && \
+    git clone -b dsv4-0903 https://github.com/PeterYang12/verl.git && \
     cd verl && \
     pip install -e .
 
