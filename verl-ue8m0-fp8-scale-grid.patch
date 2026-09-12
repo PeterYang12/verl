@@ -1,0 +1,245 @@
+# Keep the RL weight sync on the checkpoint's power-of-two FP8 scale grid.
+#
+# Apply with:  cd /app/verl && git apply verl-ue8m0-fp8-scale-grid.patch
+# Disable at runtime with VERL_UE8M0_SCALE_FIX=0; on by default.
+#
+#
+# The bug
+# -------
+# DeepSeek-V4 checkpoints declare scale_fmt: ue8m0 and store every block scale
+# as a power of two. This is the format, not a coincidence: across the whole
+# checkpoint, all 25 module classes -- attention (wq_a, wq_b, wkv, wo_a, wo_b,
+# indexer.wq_b), the MoE experts (1792 tensors x w1/w2/w3), the shared experts
+# and the MTP layer -- are 100% powers of two over 78,464 scale values, with no
+# exceptions.
+#
+# Megatron-Bridge's FP8 export ignores that and recomputes the scale as
+# amax/448, which lands back on the grid only 12.5% of the time. The fp8 codes
+# were chosen for the original grid, so a shifted grid forces every weight onto
+# new codes -- and e4m3 has 3 mantissa bits, so each re-rounding costs up to 6%.
+#
+# Measured on layer 0's wq_b:
+#
+#   scales still a power of two after export      12.5%
+#   fp8 bytes unchanged by the round trip          6.5%
+#   weight error vLLM ends up running          2.78e-02
+#   weight change from one training step       ~1e-05
+#
+# So 99.9% of the error vLLM sees is the export, not the model changing.
+#
+# Nothing is lost reading the checkpoint: Megatron's bf16 weights are
+# bit-identical to it (relL2 exactly 0), because fp8's 3 mantissa bits fit in
+# bf16's 7 and multiplying by a power of two only shifts the exponent. The loss
+# is entirely in writing back.
+#
+#
+# The fix
+# -------
+# One line of arithmetic in scale_from_amax: snap the recomputed scale up to
+# the nearest power of two. The scale is still an fp32 tensor, still recomputed
+# from the current weights on every sync, still consumed as fp32 by the
+# kernels -- only its value is constrained to the grid the checkpoint uses. The
+# weights stay fp8 e4m3, untouched. The patch is gated on the source scale
+# already being a power of two, so a model that does not use a ue8m0 grid is
+# left alone.
+#
+#
+# Evidence: the export error
+# --------------------------
+# Weight error relL2(exported, Megatron) for layer 0's wq_b, per training step,
+# and the share of exported scales still on the grid:
+#
+#              bf16 training            fp8 training (e4m3, blockwise)
+#   step    fix on    fix off         fix on    fix off
+#      0    0.0       2.7846e-02      0.0       2.7846e-02
+#      1    6.69e-06  2.7846e-02      6.69e-06  2.7846e-02
+#      2    1.15e-05  2.7846e-02      1.13e-05  2.7846e-02
+#      3    1.81e-05  --              1.81e-05  --
+#   scales  100%      12.5%           100%      12.5%
+#
+# The two training modes agree to four digits. fp8 training leaves the export
+# path alone because fp8_param is unset, so TE keeps the parameters in bf16 and
+# only quantizes inside the GEMMs. With the fix the residual error is the size
+# of the weight change itself, i.e. the requantization stops contributing.
+#
+#
+# Evidence: scale coverage at runtime
+# -----------------------------------
+# Every block scale live in the rollout engine, fix on, fp8 training, over 3
+# steps and 8 ranks -- 9,649,152 values, all powers of two:
+#
+#   attn.fused_wqa_wkv                        64,512   100%
+#   attn.indexer.wq_b                         36,864   100%
+#   attn.wo_a / wo_b / wq_b                1,032,192   100%
+#   ffn.experts.routed_experts.w13         5,505,024   100%
+#   ffn.experts.routed_experts.w2          2,752,512   100%
+#   ffn.shared_experts.gate_up / down        258,048   100%
+#
+# Without the fix the same measurement gives 12.5%.
+#
+#
+# Evidence: end to end
+# --------------------
+# DeepSeek-V4-Flash-Base-7L, GRPO, 8192-token responses, arms interleaved,
+# n=10 per arm, exact permutation test.
+#
+#   bf16 training          fix on      fix off     delta        p
+#     rollout_corr/kl      0.004587    0.008297    -44.7%   <0.0001
+#     probs_diff_mean      0.009935    0.012822    -22.5%   <0.0001
+#     probs_diff_max       0.315580    0.402501    -21.6%   <0.0001
+#     time_per_step         146.3 s     145.8 s     +0.4%     0.25
+#
+#   fp8 training           fix on      fix off     delta        p
+#     rollout_corr/kl      0.008696    0.012331    -29.5%   <0.0001
+#     probs_diff_mean      0.013586    0.015895    -14.5%   <0.0001
+#     probs_diff_max       0.406810    0.487854    -16.6%   <0.0001
+#     time_per_step         147.9 s     147.2 s     +0.5%    0.025
+#
+#   kl per run, bf16, fix on:  0.004086 0.004253 0.004489 0.004578 0.004643
+#                              0.004683 0.004684 0.004686 0.004840 0.004932
+#   kl per run, bf16, fix off: 0.007758 0.007773 0.007992 0.008103 0.008275
+#                              0.008382 0.008522 0.008599 0.008686 0.008880
+#
+# Neither comparison overlaps: the worst run with the fix beats the best run
+# without it. The absolute gain is the same in both training modes (0.0037 vs
+# 0.0036); the ratio is smaller under fp8 only because fp8 training adds ~0.004
+# of its own gap, which this fix does not address.
+#
+#
+# Limits worth knowing
+# --------------------
+# Snapping *up* means the largest weight in a block maps to somewhere in
+# [224, 448] instead of exactly 448, giving up one bit of fp8 range. On a
+# tensor that is not already on the grid that is a small loss, so this is not a
+# general "powers of two are better" claim -- it wins here only because the
+# weights are still sitting on the checkpoint's grid.
+#
+# How long that holds is not measured. Sweeping simulated drift, the fix's
+# error tracks the drift itself (1e-04 drift -> 1e-04 error) while amax/448
+# stays flat at ~2.9e-02, and the two only meet at ~5e-02 relative drift. At
+# the observed ~1e-05 per step that is thousands of steps away, but the real
+# evidence covers 5 steps at lr 1e-6. For a long post-training run, log
+# relL2(exported weight, Megatron weight) and watch it.
+#
+# All of the above is on the 7L debug model. The production 43L model has more
+# layers for the error to accumulate through and sat at a higher KL to begin
+# with, so the effect there is unmeasured and could differ in either direction.
+--- a/verl/workers/engine/megatron/transformer_impl.py	2026-09-11 13:41:40.476802334 +0000
++++ b/verl/workers/engine/megatron/transformer_impl.py	2026-09-11 13:41:40.496802363 +0000
+@@ -43,6 +43,7 @@
+     get_megatron_dynamic_cp_scheduler_cls,
+     postprocess_dynamic_cp_batch,
+ )
++from verl.utils.megatron.fp8_scale_patch import apply_fp8_ue8m0_scale_patch
+ from verl.utils.megatron.pipeline_parallel import make_batch_generator
+ from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, apply_router_replay_patch
+ from verl.utils.megatron.router_replay_utils import (
+@@ -217,6 +218,15 @@
+                 )
+             logger.info(f"QAT enabled in MegatronEngine: mode={self._qat_config.mode}")
+ 
++        # A DeepSeek-V4 checkpoint stores every block scale as a power of two
++        # (scale_fmt: ue8m0), but the FP8 export recomputes amax/448, which lands
++        # back on that grid only ~12% of the time. Re-rounding onto a shifted grid
++        # rewrites 93% of the FP8 bytes and leaves the weights vLLM runs off by
++        # ~2.8e-02 -- three orders of magnitude more than the weights change by in
++        # a step. Set VERL_UE8M0_SCALE_FIX=0 to restore the old behaviour.
++        if self.engine_config.use_mbridge and os.environ.get("VERL_UE8M0_SCALE_FIX", "1") == "1":
++            apply_fp8_ue8m0_scale_patch()
++
+         # Router replay configuration for MoE models
+         self.enable_routing_replay = self.engine_config.router_replay.mode != "disabled"
+         logger.info(f"enable_routing_replay in MegatronEngine: {self.enable_routing_replay}")
+--- /dev/null
++++ b/verl/utils/megatron/fp8_scale_patch.py
+@@ -0,0 +1,90 @@
++# Copyright 2025 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Keep the RL weight sync on the checkpoint's power-of-two FP8 scale grid.
++
++Megatron-Bridge picks the scale grid in ``scale_from_amax``, which snaps to a
++power of two only when the scale tensor's dtype is ``float8_e8m0fnu``.
++DeepSeek-V4 checkpoints declare ``scale_fmt: ue8m0`` and do store powers of two,
++but as ``float32``, so the export recomputes ``amax / 448`` and re-rounds every
++weight onto a different grid -- ~2.6% RMS error per sync even when no weight
++changed. This decides from the scale values instead.
++"""
++
++import logging
++from contextvars import ContextVar
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++_PATCH_FLAG = "_verl_ue8m0_scale_patched"
++
++# ``scale_from_amax`` does not receive the source scale and the call sites in
++# between are private helpers, so this is what keeps the patch to two functions.
++_snap_to_pow2: ContextVar[bool] = ContextVar("verl_snap_fp8_scale_to_pow2", default=False)
++
++
++def _is_power_of_two_scale(source_scale: torch.Tensor) -> bool:
++    if not isinstance(source_scale, torch.Tensor) or source_scale.numel() == 0:
++        return False
++    values = source_scale.detach().float().flatten()
++    values = values[values > 0]
++    if values.numel() == 0:
++        return False
++    return bool(torch.all(torch.log2(values).frac() == 0))
++
++
++def apply_fp8_ue8m0_scale_patch() -> bool:
++    """Patch Megatron-Bridge's FP8 export to preserve a ue8m0 scale grid.
++
++    Returns whether the patch is in place.
++    """
++    try:
++        from megatron.bridge.models.conversion import quantization_utils as qu
++    except ImportError:
++        logger.info("Megatron-Bridge quantization utils unavailable; skipping ue8m0 scale patch.")
++        return False
++
++    if not hasattr(qu, "scale_from_amax") or not hasattr(qu, "quantize_fp8_e4m3fn_like_scale"):
++        logger.warning("Megatron-Bridge has no FP8 requantization helpers; skipping ue8m0 scale patch.")
++        return False
++
++    if getattr(qu, _PATCH_FLAG, False):
++        return True
++
++    original_scale_from_amax = qu.scale_from_amax
++    original_quantize_like_scale = qu.quantize_fp8_e4m3fn_like_scale
++
++    def scale_from_amax(amax, max_quantized_value, scale_dtype):
++        scale = original_scale_from_amax(amax, max_quantized_value, scale_dtype)
++        if not _snap_to_pow2.get():
++            return scale
++        scale = scale.clamp(min=2.0**-127, max=2.0**127)
++        return torch.exp2(torch.ceil(torch.log2(scale)))
++
++    def quantize_fp8_e4m3fn_like_scale(weight, source_scale, **kwargs):
++        token = _snap_to_pow2.set(_is_power_of_two_scale(source_scale))
++        try:
++            return original_quantize_like_scale(weight, source_scale, **kwargs)
++        finally:
++            _snap_to_pow2.reset(token)
++
++    qu.scale_from_amax = scale_from_amax
++    qu.quantize_fp8_e4m3fn_like_scale = quantize_fp8_e4m3fn_like_scale
++    setattr(qu, _PATCH_FLAG, True)
++    # Printed, not logged: a node that silently misses this syncs weights on a
++    # different grid than the rest.
++    print("Applying ue8m0 FP8 scale patch to Megatron-Bridge weight export...")
++    return True
