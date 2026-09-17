@@ -1,0 +1,779 @@
+# Round the training forward the way the rollout engine does.
+#
+# Apply on top of verl-ue8m0-fp8-scale-grid.patch:
+#   cd /app/verl && git apply verl-ue8m0-fp8-scale-grid.patch
+#                && git apply verl-qat-fp8-match-rollout.patch
+#
+# Enable with:
+#   actor_rollout_ref.actor.megatron.qat.enable=True
+#   actor_rollout_ref.actor.megatron.qat.mode=fp8_blockwise
+#   VERL_QAT_KV_FAKE_QUANT=1
+#   VERL_QAT_EXTRA_IGNORE='*experts*'
+#
+#
+# What this is for
+# ----------------
+# rollout_corr/kl is the gap between the log-probs vLLM produced while
+# generating and the ones Megatron recomputes for the same tokens. Once the
+# ue8m0 fix makes the weights bit-identical, everything left is arithmetic:
+# vLLM rounds its operands to FP8 and Megatron does not. Rounding the same way
+# during training makes old_log_probs describe the policy that actually
+# generated the data, which is what old_log_probs is supposed to be.
+#
+# This is not the usual reason to do QAT. Nothing here is about making the
+# model tolerate low precision later; it is about the training and rollout
+# forwards agreeing now.
+#
+#
+# What it rounds, and why exactly this
+# ------------------------------------
+# Taken from what vLLM actually runs on ROCm/gfx950, not from what a checkpoint
+# declares:
+#
+#   linear activations  E4M3, one plain fp32 scale per 128 values along the
+#                       reduction axis. QuantFP8 is constructed with
+#                       use_ue8m0=False outright, and the DeepGEMM path that
+#                       would round scales to powers of two needs Hopper.
+#   linear weights      E4M3, one scale per 128x128 tile, snapped to a power of
+#                       two. The checkpoint's grid is ue8m0 and the weight sync
+#                       keeps it there, so amax/448 would train against weights
+#                       the rollout never holds.
+#   KV latent           the first 448 of 512 channels in E4M3 with a power-of-two
+#                       scale per 64, the trailing RoPE 64 left alone --
+#                       DeepSeek-V4's fp8_ds_mla cache layout. Quantized after
+#                       the KV layernorm and before RoPE, matching the order in
+#                       vLLM's compress kernel.
+#
+# The two operands need opposite answers on scale rounding, which is the part
+# worth double-checking against the engine rather than assuming.
+#
+# FP8 KV is not optional on ROCm: DeepSeek-V4's attention asserts on any
+# kv_cache_dtype that does not start with fp8, so the rollout cannot stop
+# rounding and training has to start.
+#
+# Gradients use a straight-through estimator.
+#
+#
+# Evidence: where the error goes, layer by layer
+# ----------------------------------------------
+# Cross-engine relL2 at layer 0, weights bit-identical in all four:
+#
+#                             base      +QAT    +QAT+KV   +QAT-MoE+KV
+#   wq_b input            1.641e-02  2.07e-03  2.07e-03     2.07e-03
+#   wq_b output           2.593e-02  7.72e-03  7.72e-03     7.72e-03
+#   wo_b output           2.955e-02  2.66e-02  1.60e-02     1.60e-02
+#   ffn output            2.120e-02  2.35e-02  2.05e-02     1.85e-02
+#   LAYEROUT              2.055e-02  2.25e-02  1.95e-02     1.76e-02
+#
+# QAT takes 70% off the attention projections. The error then more than triples
+# across the attention operator, and rounding the KV latent halves what that
+# step adds.
+#
+# The MoE experts are excluded because measuring said so: fake-quantizing them
+# leaves LAYEROUT at 2.25e-02, worse than the 2.06e-02 of not touching them at
+# all. Not for the reason first guessed -- Megatron keeps each expert as its own
+# 2D weight0..weightN and ModelOpt quantizes them one at a time, so the 128x128
+# tiling is already expert-aligned. Excluding only the intermediate between the
+# two expert GEMMs, which vLLM's fused kernel leaves in BF16, recovers part of
+# it (1.80e-02) but not all, so something else about the MoE path is still
+# mismodelled and excluding the experts outright remains the best measured
+# option.
+#
+#
+# Evidence: end to end
+# --------------------
+# DeepSeek-V4-Flash-Base-7L, GRPO, 8192-token responses, bf16 training with the
+# ue8m0 fix on both arms, interleaved, n=10 each, exact permutation test.
+#
+#                        on          off        delta        p
+#   rollout_corr/kl      0.003989    0.004612   -13.5%   0.00002
+#   probs_diff_mean      0.009181    0.009902    -7.3%   0.00063
+#   time_per_step         144.0 s     146.1 s    -1.5%   0.00287
+#
+#   kl per run, on:  0.003755 0.003832 0.003834 0.003891 0.003923
+#                    0.004039 0.004046 0.004078 0.004119 0.004369
+#   kl per run, off: 0.004178 0.004408 0.004487 0.004527 0.004560
+#                    0.004580 0.004810 0.004838 0.004845 0.004883
+#
+# Nine of the ten runs with it beat every run without it, and it is not slower:
+# at 8192 tokens the rollout dominates the step, so the extra arithmetic in the
+# training forward does not show up. At 512 tokens it does -- 425 s against
+# 150 s -- so this is cheap only at production response lengths.
+#
+# Rounding the KV latent on its own is worth about -0.9% (5 steps, one run),
+# so nearly all of the effect is the linear operands; the KV rounding matters
+# because it is what lets the layerwise error stop growing across attention.
+#
+#
+# Training health, with gradients
+# -------------------------------
+# Five steps per run with a synthetic reward that gives GRPO groups variance,
+# so the advantages do not collapse and the weights actually move:
+#
+#   run        steps   kl mean    grad_norm      entropy
+#   base_a         5   0.004544   0.175-0.234     2.1515
+#   base_b         5   0.004652   0.186-0.239     2.1499
+#   match_a        5   0.004055   0.183-0.245     2.2141
+#   match_b        5   0.004128   0.178-0.213     2.2235
+#
+# Pooled over the 20 steps that is -11.0%, close to the -13.5% the single-step
+# A/B measured, so the improvement survives the weights being updated. Gradient
+# norms overlap between the arms, which is the thing that would have to break
+# first if the straight-through estimator were causing trouble. Entropy sits
+# about 0.07 higher with fake quantization on; two runs per arm is not enough to
+# say whether that is real.
+#
+# Limits worth knowing
+# --------------------
+# Every run in the n=10 A/B had zero gradient. The 7L debug model scores -1 on
+# every sample, so GRPO groups have no variance and the advantages collapse.
+# Those runs measure forward-pass agreement, which is exactly what
+# rollout_corr/kl is, but they say nothing about what fake quantization does to
+# training. A separate 5-step run with a synthetic reward was used to check that
+# gradients stay well-behaved; see the note below.
+#
+# All of it is on the 7L debug model. The production 43L model accumulates
+# through more layers and started at a higher KL, so the size of the effect
+# there is unmeasured.
+#
+# The straight-through estimator is an approximation: the forward is rounded,
+# the backward is not. Over a long run that is a real difference from plain
+# bf16 training, and nothing here measures its effect on final model quality.
+diff -ruN base/verl/utils/megatron/kv_fake_quant.py new/verl/utils/megatron/kv_fake_quant.py
+--- a/verl/utils/megatron/kv_fake_quant.py	1970-01-01 00:00:00.000000000 +0000
++++ b/verl/utils/megatron/kv_fake_quant.py	2026-09-15 19:04:05.449454596 +0000
+@@ -0,0 +1,133 @@
++# Copyright 2025 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Make the training forward see the rounding the rollout's FP8 KV cache applies.
++
++Block-scaled QAT on the linear layers brought layer 0's ``wq_b`` output from
++2.59e-02 down to 7.7e-03, and then the gap more than tripled again across the
++attention operator. The KV cache is the obvious candidate: on ROCm, DeepSeek-V4
++stores its K latent in the ``fp8_ds_mla`` layout and that is not optional --
++asking for ``kv_cache_dtype=auto`` trips an assert in the model's own attention
++setup. If the rollout cannot stop rounding, training has to start.
++
++The layout being reproduced, from vLLM's compress/quantize kernel:
++
++* the first 448 of the 512 latent channels (``head_dim - qk_rope_head_dim``) are
++  E4M3 with one power-of-two scale per 64 channels,
++* the last 64 -- the RoPE half -- stay BF16,
++* quantization happens *after* the KV layernorm and *before* RoPE, which is why
++  this hooks the norm rather than the projection feeding it.
++
++Off unless ``VERL_QAT_KV_FAKE_QUANT=1``.
++"""
++
++from __future__ import annotations
++
++import os
++
++import torch
++
++# vLLM derives these from the checkpoint; they are asserted against the live
++# tensor at hook time rather than trusted.
++_FP8_E4M3_MAX = 448.0
++_ROPE_DIM = int(os.environ.get("VERL_QAT_KV_ROPE_DIM", "64"))
++_SCALE_BLOCK = int(os.environ.get("VERL_QAT_KV_BLOCK", "64"))
++
++# Ordered by how specific the name is. Megatron's generic MLA calls this
++# ``kv_layernorm``; other DeepSeek ports use ``k_layernorm`` or ``kv_norm``.
++_NORM_CANDIDATES = ("kv_layernorm", "k_layernorm", "kv_norm", "kv_a_layernorm")
++
++_PATCH_FLAG = "_verl_kv_fake_quant_installed"
++
++
++def enabled() -> bool:
++    return os.environ.get("VERL_QAT_KV_FAKE_QUANT", "0") == "1"
++
++
++def fake_quant_kv_latent(kv: torch.Tensor) -> torch.Tensor:
++    """Round the NoPE half of a KV latent the way the FP8 cache stores it.
++
++    ``kv`` is ``[..., head_dim]``; the trailing ``_ROPE_DIM`` channels are
++    returned untouched. A tensor whose last dimension does not split cleanly is
++    returned unchanged rather than silently quantized on the wrong boundary.
++    """
++    dim = kv.shape[-1]
++    nope = dim - _ROPE_DIM
++    if nope <= 0 or nope % _SCALE_BLOCK:
++        return kv
++
++    head, tail = kv[..., :nope], kv[..., nope:]
++
++    grouped = head.float().reshape(*head.shape[:-1], nope // _SCALE_BLOCK, _SCALE_BLOCK)
++    amax = grouped.abs().amax(dim=-1, keepdim=True)
++    # The kernel floors the amax before taking the exponent, so an all-zero
++    # block lands on a finite scale instead of -inf.
++    scale = torch.exp2(torch.ceil(torch.log2(amax.clamp(min=1e-4) / _FP8_E4M3_MAX)))
++    rounded = (grouped / scale).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn).float() * scale
++    rounded = rounded.reshape(head.shape).to(head.dtype)
++
++    # Straight-through estimator, as for the linear-layer fake quant.
++    head = head + (rounded - head).detach()
++    return torch.cat((head, tail), dim=-1)
++
++
++def _hook(_module, _args, out):
++    tensor = out[0] if isinstance(out, tuple) else out
++    if not isinstance(tensor, torch.Tensor):
++        return out
++    quantized = fake_quant_kv_latent(tensor)
++    if isinstance(out, tuple):
++        return (quantized, *out[1:])
++    return quantized
++
++
++def install(unwrapped_model) -> int:
++    """Hook the KV layernorm of every decoder layer. Returns how many were hooked.
++
++    Prints the attention submodule names when nothing matches: the DeepSeek-V4
++    layer spec is not Megatron's stock MLA, so the norm's name is worth
++    confirming rather than assuming, and a silent no-op here would look exactly
++    like the fake quant not helping.
++    """
++    if not enabled():
++        return 0
++
++    decoder = getattr(unwrapped_model, "decoder", None)
++    if decoder is None or not hasattr(decoder, "layers"):
++        return 0
++
++    hooked = 0
++    seen: list[str] = []
++    for layer in decoder.layers:
++        attn = getattr(layer, "self_attention", None)
++        if attn is None:
++            continue
++        if not seen:
++            seen = [n for n, _ in attn.named_modules() if n]
++        for candidate in _NORM_CANDIDATES:
++            norm = getattr(attn, candidate, None)
++            if norm is None or not hasattr(norm, "register_forward_hook"):
++                continue
++            if getattr(norm, _PATCH_FLAG, False):
++                break
++            norm.register_forward_hook(_hook)
++            setattr(norm, _PATCH_FLAG, True)
++            hooked += 1
++            break
++
++    if hooked:
++        print(f"KV fake quant: hooked {hooked} KV layernorms (nope={_SCALE_BLOCK}-blocks, rope={_ROPE_DIM} kept bf16)")
++    else:
++        print(f"KV fake quant: NO KV layernorm matched {_NORM_CANDIDATES}; attention submodules are {seen}")
++    return hooked
+diff -ruN base/verl/utils/modelopt/fp8_group_backend.py new/verl/utils/modelopt/fp8_group_backend.py
+--- a/verl/utils/modelopt/fp8_group_backend.py	1970-01-01 00:00:00.000000000 +0000
++++ b/verl/utils/modelopt/fp8_group_backend.py	2026-09-15 19:04:05.441454586 +0000
+@@ -0,0 +1,146 @@
++# Copyright 2025 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""FP8 fake quantization backends for ModelOpt, matching what the rollout runs.
++
++Two shapes, because the rollout engine quantizes the two operands differently:
++
++* **Activations**, one scale per 128 values along the reduction axis, recomputed
++  every forward. On ROCm that is ``aiter``'s ``per_1x128``, reached through
++  ``QuantFP8(group_shape=GroupShape(1, 128))``.
++* **Weights**, one scale per 128x128 tile, which is how the checkpoint stores
++  them and what the weight sync writes back.
++
++ModelOpt can express per-group dynamic blocking, but routes it through
++``modelopt_cuda_ext_mx``, which is CUDA-only, so these are pure-PyTorch paths.
++
++``e8m0_scale`` rounds the scale up to a power of two, and the two operands need
++opposite answers:
++
++* Activation scales stay plain float32. vLLM's block-scaled kernel constructs
++  ``QuantFP8`` with ``use_ue8m0=False`` outright, and the DeepGEMM path that
++  would do otherwise needs Hopper/Blackwell.
++* Weight scales are powers of two. DeepSeek-V4 declares ``scale_fmt: ue8m0`` and
++  stores them that way, and ``fp8_scale_patch`` keeps the weight sync on that
++  grid, so the rollout runs powers of two and training has to match.
++"""
++
++import logging
++
++import torch
++import torch.nn.functional as F
++
++logger = logging.getLogger(__name__)
++
++BACKEND_NAME = "verl_fp8_group"
++BLOCK_BACKEND_NAME = "verl_fp8_block2d"
++
++_FP8_E4M3_MAX = 448.0
++
++
++def _quantize_with_scale(values: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
++    return (values / scale).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn).float() * scale
++
++
++def _scale_from_amax(amax: torch.Tensor, e8m0_scale: bool) -> torch.Tensor:
++    # An all-zero block would otherwise divide by zero; its values quantize to 0
++    # either way.
++    scale = (amax / _FP8_E4M3_MAX).clamp(min=torch.finfo(torch.float32).tiny)
++    if e8m0_scale:
++        scale = torch.exp2(torch.ceil(torch.log2(scale)))
++    return scale
++
++
++def fp8_group_fake_quant(inputs: torch.Tensor, quantizer) -> torch.Tensor:
++    """Fake-quantize ``inputs`` to E4M3 with one scale per group along the last axis.
++
++    ``quantizer.backend_extra_args`` accepts:
++        group_size (int): values per scale, default 128.
++        e8m0_scale (bool): round scales up to a power of two, default False.
++    """
++    extra = getattr(quantizer, "backend_extra_args", None) or {}
++    group_size = int(extra.get("group_size", 128))
++    e8m0_scale = bool(extra.get("e8m0_scale", False))
++
++    orig_dtype = inputs.dtype
++    last = inputs.shape[-1]
++    pad = (-last) % group_size
++    padded = F.pad(inputs, (0, pad)) if pad else inputs
++
++    grouped = padded.float().reshape(*padded.shape[:-1], padded.shape[-1] // group_size, group_size)
++    amax = grouped.abs().amax(dim=-1, keepdim=True)
++    scale = _scale_from_amax(amax, e8m0_scale)
++
++    quantized = _quantize_with_scale(grouped, scale).reshape(*padded.shape)
++    if pad:
++        quantized = quantized[..., :last]
++    quantized = quantized.to(orig_dtype)
++
++    # Straight-through estimator: the rounding is not differentiable, so the
++    # gradient passes to the unquantized input unchanged.
++    return inputs + (quantized - inputs).detach()
++
++
++def fp8_block2d_fake_quant(inputs: torch.Tensor, quantizer) -> torch.Tensor:
++    """Fake-quantize a weight to E4M3 with one scale per 128x128 tile.
++
++    ModelOpt's own 2D blocking would do this, but computes the scale as a plain
++    ``amax / 448``. The checkpoint's grid is powers of two and the weight sync
++    stays on it, so the default would train against weights the rollout never
++    holds -- a ~2.8e-02 difference, which is what ``fp8_scale_patch`` exists to
++    avoid on the export side.
++
++    ``quantizer.backend_extra_args`` accepts:
++        block_size (int): tile edge, default 128.
++        e8m0_scale (bool): round scales up to a power of two, default True.
++    """
++    extra = getattr(quantizer, "backend_extra_args", None) or {}
++    block = int(extra.get("block_size", 128))
++    e8m0_scale = bool(extra.get("e8m0_scale", True))
++
++    if inputs.dim() != 2:
++        return fp8_group_fake_quant(inputs, quantizer)
++
++    orig_dtype = inputs.dtype
++    rows, cols = inputs.shape
++    pad_r, pad_c = (-rows) % block, (-cols) % block
++    padded = F.pad(inputs, (0, pad_c, 0, pad_r)) if (pad_r or pad_c) else inputs
++
++    tiled = padded.float().reshape(padded.shape[0] // block, block, padded.shape[1] // block, block)
++    amax = tiled.abs().amax(dim=(1, 3), keepdim=True)
++    scale = _scale_from_amax(amax, e8m0_scale)
++
++    quantized = _quantize_with_scale(tiled, scale).reshape(padded.shape)
++    if pad_r or pad_c:
++        quantized = quantized[:rows, :cols]
++    quantized = quantized.to(orig_dtype)
++
++    return inputs + (quantized - inputs).detach()
++
++
++def register() -> bool:
++    """Register the backends with ModelOpt. Returns whether they are available."""
++    try:
++        from modelopt.torch.quantization.nn.modules.tensor_quantizer import (
++            is_registered_quant_backend,
++            register_quant_backend,
++        )
++    except ImportError:
++        logger.info("ModelOpt quant backend registry unavailable; skipping %s", BACKEND_NAME)
++        return False
++
++    for name, fn in ((BACKEND_NAME, fp8_group_fake_quant), (BLOCK_BACKEND_NAME, fp8_block2d_fake_quant)):
++        if not is_registered_quant_backend(name):
++            register_quant_backend(name, fn)
++    return True
+diff -ruN base/verl/utils/modelopt/qat_utils.py new/verl/utils/modelopt/qat_utils.py
+--- a/verl/utils/modelopt/qat_utils.py	2026-09-12 14:09:49.000000000 +0000
++++ b/verl/utils/modelopt/qat_utils.py	2026-09-15 19:04:05.441454586 +0000
+@@ -39,6 +39,14 @@
+ 
+ def export_qat_weights(per_tensor_param, modules, qat_mode, bridge):
+     """Process exported weights through QATWeightExporter for quantized weight sync."""
++    from verl.utils.modelopt.quantize import uses_native_weight_sync
++
++    if uses_native_weight_sync(qat_mode):
++        # The bridge already requantizes the export stream into the checkpoint's
++        # own FP8 layout, which is what this mode trains against. Re-packing it
++        # as NVFP4 here would ship a format the rollout engine cannot load.
++        return per_tensor_param
++
+     from verl.utils.modelopt.qat_weight_exporter import QATWeightExporter
+ 
+     qat_weight_exporter = QATWeightExporter(modules, bridge, qat_mode)
+diff -ruN base/verl/utils/modelopt/quantize.py new/verl/utils/modelopt/quantize.py
+--- a/verl/utils/modelopt/quantize.py	2026-09-12 14:09:49.000000000 +0000
++++ b/verl/utils/modelopt/quantize.py	2026-09-15 19:04:05.445454592 +0000
+@@ -16,11 +16,18 @@
+ """ModelOpt NVFP4 quantization config and application for Megatron QAT."""
+ 
+ import copy
++import os
+ 
+ import modelopt.torch.quantization as mtq
++import torch
+ import torch.nn as nn
+ from modelopt.torch.quantization.config import _default_disabled_quantizer_cfg
+ 
++from verl.utils.modelopt.fp8_group_backend import BACKEND_NAME as FP8_GROUP_BACKEND
++from verl.utils.modelopt.fp8_group_backend import BLOCK_BACKEND_NAME as FP8_BLOCK_BACKEND
++from verl.utils.modelopt.fp8_group_backend import register as _register_fp8_group_backend
++from verl.workers.config.engine import QAT_FP8_BLOCKWISE_ACT_MODE, QAT_FP8_BLOCKWISE_MODE
++
+ _NVFP4_W4A16_QUANTIZER_CFG = {
+     "*weight_quantizer": {
+         "num_bits": (2, 1),
+@@ -31,6 +38,68 @@
+     "*input_quantizer": {"enable": False},
+ }
+ 
++FP8_BLOCKWISE_MODE = QAT_FP8_BLOCKWISE_MODE
++FP8_BLOCKWISE_ACT_MODE = QAT_FP8_BLOCKWISE_ACT_MODE
++
++# Matches how an FP8 inference engine computes a block-scaled W8A8 GEMM for a
++# DeepSeek-style checkpoint: E4M3 values, scales derived from each block's amax
++# and left as plain float32. All the tensor dimensions involved are multiples of
++# 128, so these block boundaries line up with the ones the weight sync uses even
++# though it tiles the HuggingFace layout rather than the Megatron one.
++_FP8_WEIGHT_QUANTIZER = {
++    "num_bits": (4, 3),
++    "block_sizes": {-1: 128, -2: 128},
++    "axis": None,
++    "enable": True,
++    # ModelOpt's own 2D blocking computes amax/448, which is a different grid
++    # from the one the rollout holds: the checkpoint's scales are powers of two
++    # and the weight sync keeps them there.
++    "backend": FP8_BLOCK_BACKEND,
++    "backend_extra_args": {"block_size": 128, "e8m0_scale": True},
++}
++_FP8_INPUT_QUANTIZER = {
++    "num_bits": (4, 3),
++    "axis": None,
++    "type": "dynamic",
++    "enable": True,
++    "backend": FP8_GROUP_BACKEND,
++    "backend_extra_args": {"group_size": 128, "e8m0_scale": False},
++}
++
++_FP8_BLOCKWISE_QUANTIZER_CFG = {
++    "*weight_quantizer": _FP8_WEIGHT_QUANTIZER,
++    "*input_quantizer": _FP8_INPUT_QUANTIZER,
++}
++
++_FP8_BLOCKWISE_ACT_QUANTIZER_CFG = {
++    "*weight_quantizer": {"enable": False},
++    "*input_quantizer": _FP8_INPUT_QUANTIZER,
++}
++
++_QUANTIZER_CFGS = {
++    "w4a16": _NVFP4_W4A16_QUANTIZER_CFG,
++    FP8_BLOCKWISE_MODE: _FP8_BLOCKWISE_QUANTIZER_CFG,
++    FP8_BLOCKWISE_ACT_MODE: _FP8_BLOCKWISE_ACT_QUANTIZER_CFG,
++}
++
++# DeepSeek-V4 keeps these in BF16 in the checkpoint (they ship no ``.scale``
++# sibling), so quantizing them in training would simulate something the rollout
++# engine never does. The names ModelOpt already disables by default -- router,
++# lm_head/output_layer, embeddings, MTP -- are not repeated here.
++_FP8_BLOCKWISE_EXTRA_IGNORE = ["*compressor*", "*indexer*"]
++
++
++def _env_extra_ignore() -> list[str]:
++    """Extra quantizer-name globs from ``VERL_QAT_EXTRA_IGNORE``, comma separated.
++
++    Which modules are worth simulating is an empirical question -- the layerwise
++    dump showed the MoE *gaining* error once its experts were fake-quantized,
++    while the attention projections lost 70% of theirs -- and answering it by
++    editing this list means rebuilding the model for every variant.
++    """
++    raw = os.environ.get("VERL_QAT_EXTRA_IGNORE", "")
++    return [p.strip() for p in raw.split(",") if p.strip()]
++
+ 
+ def _ignore_patterns_to_quant_cfg(ignore_patterns: list[str]) -> list[dict]:
+     cfg = []
+@@ -47,20 +116,33 @@
+     return cfg
+ 
+ 
++def uses_native_weight_sync(qat_mode: str) -> bool:
++    """Whether the plain weight-sync path already emits the format the mode trains in.
++
++    FP8 block-scaled QAT trains against the same layout an FP8 checkpoint is
++    stored in, and Megatron-Bridge already requantizes exported weights to it,
++    so the NVFP4 weight exporter must not run and the rollout engine's own
++    quantization config must not be overridden.
++    """
++    return qat_mode in (FP8_BLOCKWISE_MODE, FP8_BLOCKWISE_ACT_MODE)
++
++
+ def build_quantize_config(
+     qat_mode: str,
+     ignore_patterns: list[str] | None = None,
+ ) -> dict:
+     """Build a complete ModelOpt quantization config for ``mtq.quantize``."""
+-    if qat_mode != "w4a16":
+-        raise ValueError(f"Only 'w4a16' is supported, got: {qat_mode}")
++    if qat_mode not in _QUANTIZER_CFGS:
++        raise ValueError(f"Unsupported QAT mode {qat_mode!r}; expected one of {sorted(_QUANTIZER_CFGS)}")
+ 
+     if ignore_patterns is None:
+         ignore_patterns = []
++    if uses_native_weight_sync(qat_mode):
++        ignore_patterns = list(ignore_patterns) + _FP8_BLOCKWISE_EXTRA_IGNORE + _env_extra_ignore()
+ 
+     ignore_cfg = _ignore_patterns_to_quant_cfg(ignore_patterns)
+ 
+-    quant_cfg = mtq.normalize_quant_cfg_list(_NVFP4_W4A16_QUANTIZER_CFG)
++    quant_cfg = mtq.normalize_quant_cfg_list(_QUANTIZER_CFGS[qat_mode])
+     disabled_cfg = copy.deepcopy(_default_disabled_quantizer_cfg)
+     if isinstance(disabled_cfg, dict):
+         disabled_cfg = mtq.normalize_quant_cfg_list(disabled_cfg)
+@@ -75,6 +157,43 @@
+     ignore_patterns: list[str] | None = None,
+ ) -> nn.Module:
+     """Apply Quantization-Aware Training to a Megatron model."""
++    if uses_native_weight_sync(qat_mode):
++        _register_fp8_group_backend()
+     config = build_quantize_config(qat_mode, ignore_patterns)
+     mtq.quantize(model, config)
++    _report_enabled_quantizers(model, qat_mode)
+     return model
++
++
++def _report_enabled_quantizers(model: nn.Module, qat_mode: str) -> None:
++    """Print which modules ended up quantized, and which weight-carrying ones did not.
++
++    Whether a module matched decides between simulating the rollout engine's
++    arithmetic and silently training in full precision, and it depends on
++    ModelOpt recognising each module's class. A first attempt at this mode
++    quantized 70 modules out of a model whose MoE experts alone are far more
++    than that and made the train/rollout gap worse, so the misses matter at
++    least as much as the hits. Printed rather than logged so it survives the
++    worker log level.
++    """
++    weights, inputs, missed = [], [], []
++    for name, module in model.named_modules():
++        hit = False
++        for kind, bucket in (("weight_quantizer", weights), ("input_quantizer", inputs)):
++            quantizer = getattr(module, kind, None)
++            if quantizer is not None and getattr(quantizer, "is_enabled", False):
++                bucket.append(name)
++                hit = True
++        # Leaf modules owning a 2D weight are the ones that become a GEMM the
++        # rollout runs in FP8; anything else has no operand to quantize.
++        if not hit and not any(module.children()):
++            weight = getattr(module, "weight", None)
++            if isinstance(weight, torch.Tensor) and weight.dim() >= 2:
++                missed.append(f"{name}[{type(module).__name__}]")
++
++    print(f"QAT[{qat_mode}]: {len(weights)} weight quantizers, {len(inputs)} input quantizers enabled")
++    if missed:
++        # One layer's worth is enough to recognise a whole class of misses, and
++        # the full list on a 60-layer model is thousands of lines.
++        sample = sorted({m.split(".", 3)[-1] for m in missed})[:12]
++        print(f"QAT[{qat_mode}]: {len(missed)} weight-carrying modules NOT quantized, e.g. {sample}")
+diff -ruN base/verl/workers/config/engine.py new/verl/workers/config/engine.py
+--- a/verl/workers/config/engine.py	2026-09-12 14:09:49.000000000 +0000
++++ b/verl/workers/config/engine.py	2026-09-15 19:04:05.445454592 +0000
+@@ -36,6 +36,9 @@
+     "EngineConfig",
+     "EngineRouterReplayConfig",
+     "QATEngineConfig",
++    "QAT_FP8_BLOCKWISE_MODE",
++    "QAT_FP8_BLOCKWISE_ACT_MODE",
++    "QAT_FP8_BLOCKWISE_MODES",
+ ]
+ 
+ 
+@@ -123,13 +126,29 @@
+         #     assert self.micro_batch_size_per_gpu is not None
+ 
+ 
++# Canonical names of the FP8 block-scaled QAT modes. Both the Megatron quantizer
++# and the rollout engine branch on them, and neither can import the other's
++# module cheaply, so they live here next to the config field they name.
++QAT_FP8_BLOCKWISE_MODE = "fp8_blockwise"
++QAT_FP8_BLOCKWISE_ACT_MODE = "fp8_blockwise_act"
++QAT_FP8_BLOCKWISE_MODES = (QAT_FP8_BLOCKWISE_MODE, QAT_FP8_BLOCKWISE_ACT_MODE)
++
++
+ @dataclass
+ class QATEngineConfig(BaseConfig):
+     """Configuration for QAT (Quantization-Aware Training) within an engine.
+ 
+     Args:
+         enable (bool): Whether to enable QAT, default False
+-        mode (str): Quantization mode, "w4a16" or "w4a4", default "w4a16"
++        mode (str): Quantization mode, default "w4a16".
++            - "w4a16": NVFP4 weights, unquantized activations. Needs
++              ``quantization_config_path`` so the rollout engine is rebuilt to match.
++            - "fp8_blockwise": E4M3 weights on a 128x128 block grid plus E4M3
++              activations scaled per 128-wide group, i.e. what an inference engine
++              runs for a DeepSeek-style FP8 checkpoint. The rollout engine keeps
++              the quantization it detects from the checkpoint, so
++              ``quantization_config_path`` is not used.
++            - "fp8_blockwise_act": as above but activations only.
+         group_size (int): Group size for blockwise quantization, default 16
+         ignore_patterns (list[str]): Module name patterns to exclude from quantization
+         activation_observer (str): Observer strategy for activation global_scale (W4A4 only)
+diff -ruN base/verl/workers/engine/megatron/transformer_impl.py new/verl/workers/engine/megatron/transformer_impl.py
+--- a/verl/workers/engine/megatron/transformer_impl.py	2026-09-15 19:04:05.433454577 +0000
++++ b/verl/workers/engine/megatron/transformer_impl.py	2026-09-15 19:04:17.373468795 +0000
+@@ -43,6 +43,7 @@
+     get_megatron_dynamic_cp_scheduler_cls,
+     postprocess_dynamic_cp_batch,
+ )
++from verl.utils.megatron import kv_fake_quant
+ from verl.utils.megatron.fp8_scale_patch import apply_fp8_ue8m0_scale_patch
+ from verl.utils.megatron.pipeline_parallel import make_batch_generator
+ from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, apply_router_replay_patch
+@@ -218,15 +219,17 @@
+                 )
+             logger.info(f"QAT enabled in MegatronEngine: mode={self._qat_config.mode}")
+ 
+-        # A DeepSeek-V4 checkpoint stores every block scale as a power of two
+-        # (scale_fmt: ue8m0), but the FP8 export recomputes amax/448, which lands
+-        # back on that grid only ~12% of the time. Re-rounding onto a shifted grid
+-        # rewrites 93% of the FP8 bytes and leaves the weights vLLM runs off by
+-        # ~2.8e-02 -- three orders of magnitude more than the weights change by in
+-        # a step. Set VERL_UE8M0_SCALE_FIX=0 to restore the old behaviour.
+-        if self.engine_config.use_mbridge and os.environ.get("VERL_UE8M0_SCALE_FIX", "1") == "1":
++        # An FP8 checkpoint is exported back to FP8 on every weight sync; keep that
++        # requantization on the checkpoint's own scale grid. Gated so the two
++        # behaviours can be A/B'd in one build: measured on layer 0's wq_b, the
++        # export error drops from 2.78e-02 to 0 at step 0 and stays near 1e-05
++        # after, which is the size of the weight change itself rather than of
++        # the requantization.
++        if self.engine_config.use_mbridge and os.environ.get("VERL_UE8M0_SCALE_FIX", "0") == "1":
+             apply_fp8_ue8m0_scale_patch()
+ 
++        self._kv_fake_quant_installed = False
++
+         # Router replay configuration for MoE models
+         self.enable_routing_replay = self.engine_config.router_replay.mode != "disabled"
+         logger.info(f"enable_routing_replay in MegatronEngine: {self.enable_routing_replay}")
+@@ -400,9 +403,17 @@
+                     provider_overrides["enable_routing_replay"] = True
+ 
+             if self._qat_enabled:
+-                from megatron.bridge.models.gpt_provider import modelopt_transformer_layer_spec
++                from verl.utils.modelopt.quantize import uses_native_weight_sync
++
++                # This spec builds a plain GPT layer, so it drops any experimental
++                # attention variant the provider selected (DeepSeek-V4's hybrid
++                # sparse attention, for one). ModelOpt matches on module class
++                # rather than on the spec, so the FP8 modes quantize the model the
++                # provider already built instead of replacing its layers.
++                if not uses_native_weight_sync(self._qat_config.mode):
++                    from megatron.bridge.models.gpt_provider import modelopt_transformer_layer_spec
+ 
+-                provider.transformer_layer_spec = modelopt_transformer_layer_spec
++                    provider.transformer_layer_spec = modelopt_transformer_layer_spec
+ 
+             # Megatron-Bridge >= v0.5.0 provides apply_overrides_and_finalize.
+             # Megatron-Bridge <  v0.5.0 does not, so we fall back to manual setattr + finalize.
+@@ -1028,7 +1039,17 @@
+         if getattr(self.bridge, "export_weight_dtype", None) == "fp8":
+             return None
+         if self._hf_export_tasks is None:
+-            self._hf_export_tasks = self.bridge.get_conversion_tasks(self.module)
++            tasks = self.bridge.get_conversion_tasks(self.module)
++            # The bridge sizes its task list by parameter count and leaves a None
++            # wherever a parameter has no HF mapping, then dereferences every
++            # entry while streaming. QAT adds exactly such parameters (ModelOpt
++            # registers quantizer state like ``*_quantizer._amax``), and they
++            # carry no weight to export.
++            kept = [task for task in tasks if task is not None]
++            dropped = len(tasks) - len(kept)
++            if dropped:
++                logger.info("Dropping %d export tasks with no HF mapping (QAT quantizer state)", dropped)
++            self._hf_export_tasks = kept
+         return self._hf_export_tasks
+ 
+     def get_per_tensor_param(self, base_sync_done=False, **kwargs):
+@@ -1293,6 +1314,14 @@
+         loss_mask = model_inputs["loss_mask"]
+ 
+         unwrapped_model = unwrap_model(model)
++
++        # Off unless VERL_QAT_KV_FAKE_QUANT=1. The rollout's KV cache is FP8 and
++        # cannot be turned off on ROCm, so this rounds the KV latent the same way
++        # during training; see verl/utils/megatron/kv_fake_quant.py.
++        if kv_fake_quant.enabled() and not self._kv_fake_quant_installed:
++            kv_fake_quant.install(unwrapped_model)
++            self._kv_fake_quant_installed = True
++
+         cp_layout = self._get_context_parallel_layout(unwrapped_model)
+         if hasattr(unwrapped_model, "vp_stage"):
+             vp_rank = unwrapped_model.vp_stage
+diff -ruN base/verl/workers/rollout/vllm_rollout/vllm_async_server.py new/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py	2026-09-12 14:09:49.000000000 +0000
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py	2026-09-15 19:04:05.449454596 +0000
+@@ -52,7 +52,7 @@
+ from verl.utils.tokenizer import normalize_token_ids
+ from verl.utils.tracking import RLInsightLogger
+ from verl.utils.vllm.vllm_quant_utils import apply_vllm_quant_patches
+-from verl.workers.config import HFModelConfig, RolloutConfig
++from verl.workers.config import QAT_FP8_BLOCKWISE_MODES, HFModelConfig, RolloutConfig
+ from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
+ from verl.workers.rollout.utils import (
+     get_max_position_embeddings,
+@@ -1172,7 +1172,13 @@
+ 
+         # Handle QAT (Quantization-Aware Training) configuration
+         qat_config_dict = getattr(self.config, "qat", {}) or {}
+-        if qat_config_dict.get("enable", False):
++        # FP8 block-scaled QAT trains against the layout the checkpoint is already
++        # stored in, so the engine's own detection of that checkpoint is correct
++        # and must not be overridden here.
++        qat_overrides_engine_quant = qat_config_dict.get("enable", False) and (
++            qat_config_dict.get("mode") not in QAT_FP8_BLOCKWISE_MODES
++        )
++        if qat_overrides_engine_quant:
+             from verl.utils.qat import QATConfig, load_quantization_config
+ 
+             qat_config = QATConfig(**qat_config_dict)
