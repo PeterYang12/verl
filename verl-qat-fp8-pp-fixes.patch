@@ -1,0 +1,166 @@
+# Two fixes for FP8 block-scaled QAT, both only visible at scale.
+#
+# Apply on top of verl-qat-fp8-match-rollout.patch:
+#   cd /app/verl && git apply verl-qat-fp8-pp-fixes.patch
+#
+# No config or env-var change. The command line stays:
+#   VERL_UE8M0_SCALE_FIX=1 VERL_QAT_KV_FAKE_QUANT=1 VERL_QAT_EXTRA_IGNORE='*experts*'
+#   actor_rollout_ref.actor.megatron.qat.enable=True
+#   actor_rollout_ref.actor.megatron.qat.mode=fp8_blockwise
+#
+#
+# 1. mtq.quantize deadlocks under pipeline parallelism
+# ----------------------------------------------------
+# On 4 nodes with pipeline_model_parallel_layout='Et*11|t*11|t*11|t*10L' the job
+# hung in model init and every rank timed out after 30 minutes:
+#
+#   #2 sync_amax_across_distributed_group tensor_quantizer.py:1376
+#   #3 sync_quantizer_amax_across_dp_ep    model_calib.py:390
+#   #4 max_calibrate                       model_calib.py:399
+#   #10 quantize                           model_quant.py:247
+#   #11 apply_qat                          verl/utils/modelopt/quantize.py:163
+#   RuntimeError: Watchdog caught collective operation timeout: ALLREDUCE
+#
+# max_calibrate all-reduces every quantizer's _amax over the module's
+# parallel_state.data_parallel_group. ModelOpt's ParallelState defaults that
+# group to None, and its own docstring says None means the whole world, not the
+# DP group:
+#
+#   if a parallel group is `None`, it will use the default PyTorch distributed
+#   process group which is the whole world.
+#
+# These modes deliberately skip modelopt_transformer_layer_spec so the provider
+# keeps DeepSeek-V4's hybrid sparse attention, which leaves part of the model
+# without a Megatron-populated parallel_state. Those modules all-reduce over the
+# world instead, and the stages hold different numbers of layers -- 11 layers is
+# 66 quantizers, the last stage's 10 layers is 60 -- so the ranks issue different
+# numbers of collectives and wait on each other forever. PP=1 never sees it.
+#
+# The calibration was doing nothing in the first place. TensorQuantizer's
+# _fake_quantize hands off to a registered backend before it reads _amax:
+#
+#   def _fake_quantize(self, inputs):
+#       if self.backend is not None:
+#           entrypoint = _QUANT_FUNCTIONAL_BACKENDS[self.backend]
+#           return entrypoint(inputs, self)
+#       amax = None
+#       ...
+#
+# and both FP8 quantizers set a backend that computes its scales from the tensor
+# at call time. So algorithm=None for these modes. w4a16 keeps "max": its path
+# goes through dynamic_block_quant, which does read amax.
+#
+# Verified bitwise neutral -- same seed, same input, torch.equal(before, after)
+# is True and the max abs difference is 0.0. The only change is that
+# `0.weight_quantizer._amax` is no longer registered.
+#
+#
+# 2. The weight quantizer was rounding on a 1x128 grid, not 128x128
+# ------------------------------------------------------------------
+# A quantizer whose block_sizes carry no "type": "dynamic" is a static block
+# quantizer, and TensorQuantizer.forward reshapes the tensor into its tiled view
+# before calling the backend. fp8_block2d_fake_quant therefore never received a
+# 2D weight; instrumenting the backend on a [512, 256] Linear:
+#
+#   weight shape                       (512, 256)
+#   backend block2d received shapes    [(4, 128, 2, 128)]
+#
+# Its `if inputs.dim() != 2: return fp8_group_fake_quant(...)` guard then sent it
+# down the group path, which groups along the last axis -- the within-tile column
+# index -- for one scale per 1x128 row segment. That is a finer grid than the
+# checkpoint's and the rollout's, so training rounded its weights less than vLLM
+# does and the two engines stayed out of step.
+#
+# Reducing over the axes ModelOpt left out of _axis restores the 128x128 tile.
+# Checked against a hand-tiled reference: the quantizer's output is now bitwise
+# equal to the 128x128 reference and no longer equal to the 1x128 one, the
+# activation quantizer is untouched (type: dynamic, so is_static_block_quant is
+# False), the straight-through gradient still reaches both input and weight, and
+# a direct 2D call still tiles at 128x128.
+#
+# Expect no movement in rollout_corr/kl from this one. The checkpoint's weights
+# are already stored on the 128x128 ue8m0 grid, so at step 0 the fake quant is
+# an identity map either way -- measured on layer 1, every attention projection
+# round-trips with 0.000e+00 error on both grids:
+#
+#   layers.1.attn.wq_a.weight   (1024, 4096)    128x128=0.000e+00  1x128=0.000e+00
+#   layers.1.attn.wq_b.weight   (32768, 1024)   128x128=0.000e+00  1x128=0.000e+00
+#   layers.1.attn.wo_a.weight   (8192, 4096)    128x128=0.000e+00  1x128=0.000e+00
+#   layers.1.attn.wkv.weight    (512, 4096)     128x128=0.000e+00  1x128=0.000e+00
+#   layers.1.attn.wo_b.weight   (4096, 8192)    128x128=0.000e+00  1x128=0.000e+00
+#
+# It starts to matter once the optimizer pushes the weights off that grid, and
+# even then the power-of-two scale makes the two granularities agree on all but
+# a fraction of a percent of elements. This is a correctness fix, not a win.
+#
+--- a/verl/utils/modelopt/quantize.py
++++ b/verl/utils/modelopt/quantize.py
+@@ -148,7 +148,17 @@
+         disabled_cfg = mtq.normalize_quant_cfg_list(disabled_cfg)
+     quant_cfg.extend(disabled_cfg)
+     quant_cfg.extend(ignore_cfg)
+-    return {"quant_cfg": quant_cfg, "algorithm": "max"}
++
++    # The FP8 backends derive every scale from the tensor in front of them, and
++    # ``TensorQuantizer._fake_quantize`` dispatches to a registered backend before
++    # it reads ``_amax``, so calibration here produces state nothing consumes.
++    # It also hangs with pipeline parallelism: ``max_calibrate`` all-reduces each
++    # quantizer's amax, and a module whose ``parallel_state`` Megatron never
++    # populated falls back to ModelOpt's default, which is the whole world rather
++    # than the DP group. Stages holding different numbers of layers then issue
++    # different numbers of collectives and the job deadlocks in ``mtq.quantize``.
++    algorithm = None if uses_native_weight_sync(qat_mode) else "max"
++    return {"quant_cfg": quant_cfg, "algorithm": algorithm}
+ 
+ 
+ def apply_qat(
+--- a/verl/utils/modelopt/fp8_group_backend.py
++++ b/verl/utils/modelopt/fp8_group_backend.py
+@@ -92,6 +92,27 @@
+     return inputs + (quantized - inputs).detach()
+ 
+ 
++def _static_block_keep_axes(quantizer, inputs: torch.Tensor) -> set[int] | None:
++    """Axes ModelOpt wants one scale per, when it has already tiled ``inputs``.
++
++    A quantizer whose ``block_sizes`` carry no ``"type": "dynamic"`` is a *static*
++    block quantizer, and ``TensorQuantizer.forward`` reshapes the tensor into its
++    tiled view before handing it to the backend: a ``[rows, cols]`` weight blocked
++    on both axes arrives as ``[rows/128, 128, cols/128, 128]``. ``_axis`` then
++    names the axes that carry one scale each, so the tile is what is left over.
++
++    Returns ``None`` when the tensor reached the backend unreshaped.
++    """
++    if not getattr(quantizer, "is_static_block_quant", False):
++        return None
++    axis = getattr(quantizer, "_axis", None)
++    if axis is None:
++        return None
++    ndim = inputs.dim()
++    keep = {a % ndim for a in axis}
++    return keep if len(keep) < ndim else None
++
++
+ def fp8_block2d_fake_quant(inputs: torch.Tensor, quantizer) -> torch.Tensor:
+     """Fake-quantize a weight to E4M3 with one scale per 128x128 tile.
+ 
+@@ -109,6 +130,19 @@
+     block = int(extra.get("block_size", 128))
+     e8m0_scale = bool(extra.get("e8m0_scale", True))
+ 
++    keep_axes = _static_block_keep_axes(quantizer, inputs)
++    if keep_axes is not None:
++        # Already tiled, and padded to the block edge by the caller. Reducing over
++        # the axes ModelOpt left out of ``_axis`` is what makes this a 128x128
++        # scale; falling through to the group path below would instead put one
++        # scale on each 1x128 row of a tile, which is a finer grid than the
++        # rollout's and so leaves the two engines rounding differently.
++        values = inputs.float()
++        reduce_dims = tuple(d for d in range(inputs.dim()) if d not in keep_axes)
++        scale = _scale_from_amax(values.abs().amax(dim=reduce_dims, keepdim=True), e8m0_scale)
++        quantized = _quantize_with_scale(values, scale).to(inputs.dtype)
++        return inputs + (quantized - inputs).detach()
++
+     if inputs.dim() != 2:
+         return fp8_group_fake_quant(inputs, quantizer)
+ 
