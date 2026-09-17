@@ -1,0 +1,166 @@
+# Make the recompute-backward activation release switchable.
+#
+# Apply on top of the other three patches (it touches a file none of them do):
+#   cd /app/verl && git apply verl-mcore-ckpt-activation-release-switch.patch
+#
+# Default behaviour is unchanged. To take the release out of the picture:
+#   VERL_MCORE_RELEASE_CKPT_ACTIVATIONS=0
+# Multi-node, pass it the same way as the other env vars so the Ray workers get
+# it -- an `export` in the launch script only reaches the driver:
+#   '+ray_kwargs.ray_init.runtime_env.env_vars.VERL_MCORE_RELEASE_CKPT_ACTIVATIONS="0"'
+# The worker log then prints, once per rank at model init:
+#   Megatron recompute backward: keeping checkpoint activations (...=0)
+#
+#
+# What this is for
+# ----------------
+# 4 nodes, 43 layers, PP=4 EP=8, BF16, no QAT: the job hangs partway into a step
+# and every rank times out after Megatron's default 30 minutes. The first rank to
+# report is inside an expert-parallel all-to-all in the recompute backward:
+#
+#   #0 all_to_all_single            torch/distributed/distributed_c10d.py:4829
+#   #2 forward                      megatron/core/tensor_parallel/mappings.py:446
+#   #4 backward                     megatron/core/tensor_parallel/mappings.py:470
+#   #6 _engine_run_backward         torch/autograd/graph.py:869
+#   #8 patch_backward               verl/models/mcore/patch.py
+#   [PG ID 10 ... EXPERT_MODEL_PARALLEL_GROUP Rank 2] ALLTOALL_BASE SeqNum=77597
+#
+# Eight ranks report it, all on one node -- with TP=1 CP=1 PP=4 on 32 GPUs an EP
+# group is exactly one pipeline stage, i.e. one node's 8 GPUs -- so the stuck
+# collective is intra-node and the remaining 24 ranks are downstream victims
+# blocked in pipeline p2p. All eight members had already enqueued the collective
+# (`last enqueued 77598, last completed 77596`), so nobody is missing; the
+# collective itself does not finish.
+#
+# The split sizes are not the culprit: token_dispatcher.py derives output_splits
+# from an all-gather of every rank's num_local_tokens_per_expert, so the two
+# sides of the all-to-all agree by construction.
+#
+# That leaves the frame directly above the collective. patch_backward releases
+# the checkpoint's saved inputs and their grads with
+#
+#   t.record_stream(cur_stream)
+#   t.untyped_storage().resize_(0)
+#
+# which returns the storage to the allocator immediately, past any reference
+# still held to it. Two things make that hazardous here:
+#
+#   * The construct has already caused one bug of exactly this shape in this
+#     file. The MTP guard right above it exists because the saved hidden_states
+#     aliased a torch.chunk view of the decoder output and resize_(0) truncated
+#     storage the decoder still needed -> async CUDA illegal-memory-access. The
+#     guard fixed that one instance, not the general hazard, and DeepSeek-V4's
+#     MoE and hybrid attention have other aliasing.
+#   * recompute_granularity=full with recompute_num_layers=1 runs this for all 43
+#     layers of every microbatch, and the MoE all-to-all is the largest async
+#     collective in the graph, so it is the most likely to still be in flight.
+#
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True then decides the symptom: a
+# freed expandable segment can have its pages unmapped, so a pointer captured at
+# enqueue time stalls the kernel rather than quietly reading the wrong numbers.
+# That matches a clean 30-minute timeout with no numerical blowup beforehand.
+#
+# This is a mechanism-level argument, not a proven call chain -- which aliasing
+# path it is has not been identified. The switch exists so the hypothesis can be
+# tested for the cost of one run instead of one bisect.
+#
+#
+# Cost of turning it off
+# ----------------------
+# The release is there for a reason: without it the checkpoint inputs and their
+# grads stay resident after forward_backward (Megatron-LM PR #3267). Expect the
+# MoE residual memory back. The run this was written for sat at 142.9 GB
+# allocated / 157.6 GB reserved, so there is not much headroom -- if it OOMs
+# instead of hanging, that is still information, but plan for it.
+#
+#
+# Verified
+# --------
+# Megatron's own rd.checkpoint on one GPU, both modes, against a
+# non-checkpointed reference:
+#
+#   RESULT mode=default input_storage_released=True  grad_max_abs_diff=0.000e+00
+#   RESULT mode=keep    input_storage_released=False grad_max_abs_diff=0.000e+00
+#
+# So: default is bit-identical to before and still frees the storage; with the
+# switch off the storage survives and the gradients are unchanged. (The default
+# run also shows why the release is delicate -- touching the input tensor after
+# backward raises "CUDA error: invalid argument", because its storage is gone.)
+#
+--- a/verl/models/mcore/patch.py
++++ b/verl/models/mcore/patch.py
+@@ -593,19 +593,34 @@
+ 
+ # When using checkpoint + MoE models (like Qwen3-30B-A3B and Qwen3-VL-30B-A3B),
+ # input tensors and their grads will stay in gpu memory after forward_backward completes.
+ # see https://github.com/NVIDIA/Megatron-LM/pull/3267
+ def apply_patch_megatron_recomputation_backward():
++    import os
++
+     import megatron.core.tensor_parallel.random as rd
+     import torch
+ 
+     _fork_rng = rd._fork_rng
+     _set_all_rng_states = rd._set_all_rng_states
+     detach_variable = rd.detach_variable
+     gather_split_1d_tensor = rd.gather_split_1d_tensor
+     safely_set_viewless_tensor_data = rd.safely_set_viewless_tensor_data
+ 
++    # ``resize_(0)`` hands the storage back to the allocator immediately, past any
++    # reference still held to it, so it is only correct while nothing else points
++    # at that memory. The MTP case below is one place where that did not hold; on
++    # DeepSeek-V4 with EP the symptom is an expert-parallel all-to-all in this very
++    # backward that never completes, and the released activations are the first
++    # suspect. Read once here rather than per call: this runs for every layer of
++    # every microbatch.
++    release_activations = os.environ.get("VERL_MCORE_RELEASE_CKPT_ACTIVATIONS", "1") == "1"
++    if not release_activations:
++        # Printed, not logged, so it survives the worker log level -- a node that
++        # silently kept the release would be the one that still hangs.
++        print("Megatron recompute backward: keeping checkpoint activations (VERL_MCORE_RELEASE_CKPT_ACTIVATIONS=0)")
++
+     @staticmethod
+     def patch_backward(ctx, *args):
+         """Backward pass."""
+         if not torch.autograd._is_checkpoint_valid():
+             raise RuntimeError("Checkpointing is not compatible with .grad(), please use .backward() if possible")
+@@ -639,27 +654,28 @@
+             else inp.grad
+             if isinstance(inp, torch.Tensor)
+             else inp
+             for inp in detached_inputs
+         )
+-        cur_stream = torch.cuda.current_stream()
+         # Release saved input/grad tensors (MoE residual-memory leak fix, commit 04df110c).
+         # Skip MTP layer checkpoints: their saved ``hidden_states`` aliases the decoder
+         # output (a ``torch.chunk`` view), and MTP backward runs before the decoder
+         # backward, so ``resize_(0)`` would truncate storage the decoder still needs
+         # -> async CUDA illegal-memory-access.
+         is_mtp_checkpoint = False
+-        run_fn = getattr(ctx, "run_function", None)
+-        for cell in getattr(run_fn, "__closure__", None) or ():
+-            try:
+-                obj = cell.cell_contents
+-            except ValueError:
+-                continue
+-            if obj.__class__.__name__ == "MultiTokenPredictionLayer":
+-                is_mtp_checkpoint = True
+-                break
+-        if not is_mtp_checkpoint:
++        if release_activations:
++            run_fn = getattr(ctx, "run_function", None)
++            for cell in getattr(run_fn, "__closure__", None) or ():
++                try:
++                    obj = cell.cell_contents
++                except ValueError:
++                    continue
++                if obj.__class__.__name__ == "MultiTokenPredictionLayer":
++                    is_mtp_checkpoint = True
++                    break
++        if release_activations and not is_mtp_checkpoint:
++            cur_stream = torch.cuda.current_stream()
+             for t in detached_inputs:
+                 if isinstance(t, torch.Tensor) and t.requires_grad:
+                     t.record_stream(cur_stream)
+                     t.untyped_storage().resize_(0)
+                     if t.grad is not None:
