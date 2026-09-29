@@ -3,11 +3,15 @@ FROM vllm/vllm-openai-rocm:v0.26.0 AS verl_base
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip3 install \
-    https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.3/apex-1.9.0%2Brocm7.2.3.git355db9b8-cp312-cp312-linux_x86_64.whl \
-    https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.3/transformer_engine-2.6.0-py3-none-any.whl \
-    https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.3/transformer_engine_rocm-2.6.0-py3-none-manylinux_2_28_x86_64.whl
+    https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.3/apex-1.9.0%2Brocm7.2.3.git355db9b8-cp312-cp312-linux_x86_64.whl
 
-RUN pip install --no-build-isolation  https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.3/transformer_engine_torch-2.6.0.tar.gz
+# Transformer Engine (ROCm build) 2.18.0.dev0+8c116a51b: the build the DeepSeek-V4 runs were validated with.
+ARG TE_WHEEL="transformer_engine-2.18.0.dev0+8c116a51b-cp312-cp312-linux_x86_64.whl"
+ARG TE_WHEEL_URL="https://github.com/PeterYang12/Daily_LLM/releases/download/v0.0.2/${TE_WHEEL}"
+RUN --mount=type=cache,target=/root/.cache/pip \
+    wget -q -O /tmp/${TE_WHEEL} "${TE_WHEEL_URL}" && \
+    pip install --no-build-isolation /tmp/${TE_WHEEL} && \
+    rm /tmp/${TE_WHEEL}
 
 # ROCM7.2.x driver will not return memory when large torch tensor allocated and turn 'expandable_segments:True' on
 # This issue has been fixed in higher ROCM version, so self build a libhsa-runtime to bypass OOM issue 
@@ -20,17 +24,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install qwen_vl_utils && \
     pip install flash-linear-attention
 
-ARG MEGATRON_LM_REPO="https://github.com/NVIDIA/Megatron-LM.git"
-ARG MEGATRON_LM_COMMIT="fd1121b8ff7e3a4f83a28d35aed172d7bc0260e1"
+# NVIDIA/Megatron-LM fd1121b8f plus the DeepSeek-V4 ROCm commits.
+ARG MEGATRON_LM_REPO="https://github.com/PeterYang12/Megatron-LM.git"
+ARG MEGATRON_LM_BRANCH="deepseek-v4-rocm-support"
 
 COPY docker/rocm/patches /opt/patches
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-deps "nvidia-modelopt>=0.37.0" "pulp<4.0" && \
-    git clone ${MEGATRON_LM_REPO} /opt/Megatron-LM && \
+    git clone -b ${MEGATRON_LM_BRANCH} ${MEGATRON_LM_REPO} /opt/Megatron-LM && \
     cd /opt/Megatron-LM && \
-    git fetch --depth 1 origin ${MEGATRON_LM_COMMIT} && \
-    git checkout ${MEGATRON_LM_COMMIT} && \
-    git apply /opt/patches/non-leaf-fix.patch && \
     pip install -e . --no-deps
 
 ARG MEGATRON_BRIDGE_REPO="https://github.com/NVIDIA-NeMo/Megatron-Bridge"
@@ -47,9 +49,10 @@ RUN cd /usr/local/lib/python3.12/dist-packages && \
     patch -p1 < /opt/patches/vllm-dsv4-indexer-blockflat-layout.patch && \
     cd /app
 
-ARG BUILD_DATE="2026-09-03"
+ARG BUILD_DATE="2026-09-29"
+ARG VERL_BRANCH="dsv4-rocm-clean"
 RUN --mount=type=cache,target=/root/.cache/pip \
-    git clone -b dsv4-0903 https://github.com/PeterYang12/verl.git && \
+    git clone -b ${VERL_BRANCH} https://github.com/PeterYang12/verl.git && \
     cd verl && \
     pip install -e .
 
