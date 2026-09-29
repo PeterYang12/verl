@@ -43,6 +43,7 @@ from verl.utils.dynamic_cp_scheduler import (
     get_megatron_dynamic_cp_scheduler_cls,
     postprocess_dynamic_cp_batch,
 )
+from verl.utils.megatron import kv_fake_quant
 from verl.utils.megatron.fp8_scale_patch import apply_fp8_ue8m0_scale_patch
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
 from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, apply_router_replay_patch
@@ -226,6 +227,8 @@ class MegatronEngine(BaseEngine):
         # the requantization.
         if self.engine_config.use_mbridge and os.environ.get("VERL_UE8M0_SCALE_FIX", "0") == "1":
             apply_fp8_ue8m0_scale_patch()
+
+        self._kv_fake_quant_installed = False
 
         # Router replay configuration for MoE models
         self.enable_routing_replay = self.engine_config.router_replay.mode != "disabled"
@@ -1293,6 +1296,14 @@ class MegatronEngineWithLMHead(MegatronEngine):
         loss_mask = model_inputs["loss_mask"]
 
         unwrapped_model = unwrap_model(model)
+
+        # Off unless VERL_QAT_KV_FAKE_QUANT=1. The rollout's KV cache is FP8 and
+        # cannot be turned off on ROCm, so this rounds the KV latent the same way
+        # during training; see verl/utils/megatron/kv_fake_quant.py.
+        if kv_fake_quant.enabled() and not self._kv_fake_quant_installed:
+            kv_fake_quant.install(unwrapped_model)
+            self._kv_fake_quant_installed = True
+
         cp_layout = self._get_context_parallel_layout(unwrapped_model)
         if hasattr(unwrapped_model, "vp_stage"):
             vp_rank = unwrapped_model.vp_stage
