@@ -52,7 +52,7 @@ from verl.utils.profiler import (
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.tracking import RLInsightLogger
 from verl.utils.vllm.vllm_quant_utils import apply_vllm_quant_patches
-from verl.workers.config import HFModelConfig, RolloutConfig
+from verl.workers.config import QAT_FP8_BLOCKWISE_MODES, HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import (
     get_max_position_embeddings,
@@ -1172,7 +1172,13 @@ class vLLMHttpServer:
 
         # Handle QAT (Quantization-Aware Training) configuration
         qat_config_dict = getattr(self.config, "qat", {}) or {}
-        if qat_config_dict.get("enable", False):
+        # FP8 block-scaled QAT trains against the layout the checkpoint is already
+        # stored in, so the engine's own detection of that checkpoint is correct
+        # and must not be overridden here.
+        qat_overrides_engine_quant = qat_config_dict.get("enable", False) and (
+            qat_config_dict.get("mode") not in QAT_FP8_BLOCKWISE_MODES
+        )
+        if qat_overrides_engine_quant:
             from verl.utils.qat import QATConfig, load_quantization_config
 
             qat_config = QATConfig(**qat_config_dict)

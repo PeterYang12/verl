@@ -39,6 +39,14 @@ def apply_qat_to_modules(modules, qat_config):
 
 def export_qat_weights(per_tensor_param, modules, qat_mode, bridge):
     """Process exported weights through QATWeightExporter for quantized weight sync."""
+    from verl.utils.modelopt.quantize import uses_native_weight_sync
+
+    if uses_native_weight_sync(qat_mode):
+        # The bridge already requantizes the export stream into the checkpoint's
+        # own FP8 layout, which is what this mode trains against. Re-packing it
+        # as NVFP4 here would ship a format the rollout engine cannot load.
+        return per_tensor_param
+
     from verl.utils.modelopt.qat_weight_exporter import QATWeightExporter
 
     qat_weight_exporter = QATWeightExporter(modules, bridge, qat_mode)

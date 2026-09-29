@@ -36,6 +36,9 @@ __all__ = [
     "EngineConfig",
     "EngineRouterReplayConfig",
     "QATEngineConfig",
+    "QAT_FP8_BLOCKWISE_MODE",
+    "QAT_FP8_BLOCKWISE_ACT_MODE",
+    "QAT_FP8_BLOCKWISE_MODES",
 ]
 
 
@@ -123,13 +126,29 @@ class EngineConfig(BaseConfig):
         #     assert self.micro_batch_size_per_gpu is not None
 
 
+# Canonical names of the FP8 block-scaled QAT modes. Both the Megatron quantizer
+# and the rollout engine branch on them, and neither can import the other's
+# module cheaply, so they live here next to the config field they name.
+QAT_FP8_BLOCKWISE_MODE = "fp8_blockwise"
+QAT_FP8_BLOCKWISE_ACT_MODE = "fp8_blockwise_act"
+QAT_FP8_BLOCKWISE_MODES = (QAT_FP8_BLOCKWISE_MODE, QAT_FP8_BLOCKWISE_ACT_MODE)
+
+
 @dataclass
 class QATEngineConfig(BaseConfig):
     """Configuration for QAT (Quantization-Aware Training) within an engine.
 
     Args:
         enable (bool): Whether to enable QAT, default False
-        mode (str): Quantization mode, "w4a16" or "w4a4", default "w4a16"
+        mode (str): Quantization mode, default "w4a16".
+            - "w4a16": NVFP4 weights, unquantized activations. Needs
+              ``quantization_config_path`` so the rollout engine is rebuilt to match.
+            - "fp8_blockwise": E4M3 weights on a 128x128 block grid plus E4M3
+              activations scaled per 128-wide group, i.e. what an inference engine
+              runs for a DeepSeek-style FP8 checkpoint. The rollout engine keeps
+              the quantization it detects from the checkpoint, so
+              ``quantization_config_path`` is not used.
+            - "fp8_blockwise_act": as above but activations only.
         group_size (int): Group size for blockwise quantization, default 16
         ignore_patterns (list[str]): Module name patterns to exclude from quantization
         activation_observer (str): Observer strategy for activation global_scale (W4A4 only)

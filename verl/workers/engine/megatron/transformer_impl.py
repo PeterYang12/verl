@@ -403,9 +403,17 @@ class MegatronEngine(BaseEngine):
                     provider_overrides["enable_routing_replay"] = True
 
             if self._qat_enabled:
-                from megatron.bridge.models.gpt_provider import modelopt_transformer_layer_spec
+                from verl.utils.modelopt.quantize import uses_native_weight_sync
 
-                provider.transformer_layer_spec = modelopt_transformer_layer_spec
+                # This spec builds a plain GPT layer, so it drops any experimental
+                # attention variant the provider selected (DeepSeek-V4's hybrid
+                # sparse attention, for one). ModelOpt matches on module class
+                # rather than on the spec, so the FP8 modes quantize the model the
+                # provider already built instead of replacing its layers.
+                if not uses_native_weight_sync(self._qat_config.mode):
+                    from megatron.bridge.models.gpt_provider import modelopt_transformer_layer_spec
+
+                    provider.transformer_layer_spec = modelopt_transformer_layer_spec
 
             # Megatron-Bridge >= v0.5.0 provides apply_overrides_and_finalize.
             # Megatron-Bridge <  v0.5.0 does not, so we fall back to manual setattr + finalize.
@@ -1031,7 +1039,17 @@ class MegatronEngine(BaseEngine):
         if getattr(self.bridge, "export_weight_dtype", None) == "fp8":
             return None
         if self._hf_export_tasks is None:
-            self._hf_export_tasks = self.bridge.get_conversion_tasks(self.module)
+            tasks = self.bridge.get_conversion_tasks(self.module)
+            # The bridge sizes its task list by parameter count and leaves a None
+            # wherever a parameter has no HF mapping, then dereferences every
+            # entry while streaming. QAT adds exactly such parameters (ModelOpt
+            # registers quantizer state like ``*_quantizer._amax``), and they
+            # carry no weight to export.
+            kept = [task for task in tasks if task is not None]
+            dropped = len(tasks) - len(kept)
+            if dropped:
+                logger.info("Dropping %d export tasks with no HF mapping (QAT quantizer state)", dropped)
+            self._hf_export_tasks = kept
         return self._hf_export_tasks
 
     def get_per_tensor_param(self, base_sync_done=False, **kwargs):
