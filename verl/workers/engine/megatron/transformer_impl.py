@@ -43,6 +43,7 @@ from verl.utils.dynamic_cp_scheduler import (
     get_megatron_dynamic_cp_scheduler_cls,
     postprocess_dynamic_cp_batch,
 )
+from verl.utils.megatron.fp8_scale_patch import apply_fp8_ue8m0_scale_patch
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
 from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, apply_router_replay_patch
 from verl.utils.megatron.router_replay_utils import (
@@ -216,6 +217,15 @@ class MegatronEngine(BaseEngine):
                     "Please set 'use_mbridge=True' and 'vanilla_mbridge=False'."
                 )
             logger.info(f"QAT enabled in MegatronEngine: mode={self._qat_config.mode}")
+
+        # An FP8 checkpoint is exported back to FP8 on every weight sync; keep that
+        # requantization on the checkpoint's own scale grid. Gated so the two
+        # behaviours can be A/B'd in one build: measured on layer 0's wq_b, the
+        # export error drops from 2.78e-02 to 0 at step 0 and stays near 1e-05
+        # after, which is the size of the weight change itself rather than of
+        # the requantization.
+        if self.engine_config.use_mbridge and os.environ.get("VERL_UE8M0_SCALE_FIX", "0") == "1":
+            apply_fp8_ue8m0_scale_patch()
 
         # Router replay configuration for MoE models
         self.enable_routing_replay = self.engine_config.router_replay.mode != "disabled"
