@@ -97,7 +97,7 @@ jobs:
     runs-on: [rocm-mi300]
     timeout-minutes: 60 # Increase this timeout value as needed
     container:
-      # built from https://github.com/mingjielu/Training-dockerfile/blob/main/ubuntu/rocm7.14_verl_0810_py312/Dockerfile
+      # built from docker/rocm/Dockerfile.rocm in this repo
       image: "verlai/verl:rocm7.14_torch2.12_release_1111"
       options: >-
         --device /dev/kfd
