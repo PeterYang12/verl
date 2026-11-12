@@ -44,8 +44,8 @@ RUN pip install --no-cache-dir setuptools_scm && \
       /workspace/vllm/vllm/model_executor/layers/fused_moe/oracle/unquantized.py && \
     pip install --no-cache-dir -r requirements/rocm.txt && \
     MAX_JOBS=64 python3 setup.py develop --no-deps
-RUN pip install --no-cache-dir tilelang==0.1.15 && pip install --no-cache-dir --no-deps xgrammar==0.1.32
-
+RUN pip install --no-cache-dir tilelang==0.1.15
+RUN pip install --no-cache-dir --no-deps xgrammar==0.1.32
 
 FROM install_vllm AS install_verl
 ARG VERL_TAG="7b19203c52503760f92e0368067c7eb744236274"
