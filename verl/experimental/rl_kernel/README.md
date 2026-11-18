@@ -79,17 +79,38 @@ Sync closes admissions and clears caches before export. A missing shard, stale
 version, changed worker PID, incomplete readback, nonfinite score or bit mismatch
 fails the run. Ordinary non-RLK entrypoints and registries are unchanged.
 
-## Acceptance status
+## Strict acceptance
 
-This branch is integration code awaiting machine-side validation. No GPU test or
-complete GRPO acceptance is claimed here. Earlier #711 diagnostic results do not
-qualify this new full trainer entrypoint. Run three continuous real updates in
-one job, retaining worker PIDs and optimizer state; do not restart version one
-three times. Save all logs and failures, confirm a clean exit, and inspect the
-evidence above before reporting success.
+Use the source-locked image builder, four-device launcher, checkpoint inventory
+and independent `verify_grpo.py` from RLK #711. The launcher executes this formal
+entrypoint in a new container with model, data, cache and output mounts only.
+`copy_task.py` supplies six explicit text-copy instructions and a reference-based
+normalized Levenshtein reward for functional integration; it is not a benchmark
+or evidence of learning gains. Other supported real rule-reward datasets remain
+configurable through the normal trainer.
 
-Also verify actual B1/B2 scheduling, fixed token alignment and AB/BA/repeat batch
-invariance on the same weight version. A request list of length two alone does
-not prove that the engine executed a two-request batch. Add any runtime fixes to
-this existing community-fork branch and RLK #711 as appropriate. Do not submit
-changes to upstream verl, Megatron, Bridge, vLLM or AITER, and do not auto-merge.
+The audit keeps fixed sequences across versions and also generates fresh A/B/C
+responses after each update. It observes actual B1/B2 AB/BA/AC/CA and repeats on
+both native engines, including real scheduler ordering and actor forward inputs.
+The raw FP32 words are saved before any comparison can fail. The native PPO loss,
+PP transfers, effective gradients, changed parameters and optimizer/moment state
+are recorded at every step. Only the final actor PP stage evaluates the loss.
+
+RLK binds compressor FP32 projection on both native MCore and AMD vLLM, including
+the latter's fused main/indexer GEMM. Shape-dependent production GEMM accumulation
+otherwise differed on natural-language tokens despite matching operands and
+original weights. Original BF16 compressor parameters, packed FP4/FP8 bases and
+scales retain their dtypes; only the three routing-index tables use the existing
+lossless int64-to-int32 native ABI. Quantized bases remain frozen.
+
+The native 1F1B schedule declares its actual microbatch count to RLK's canonical
+backward session before registration. Parameter VJPs are emitted only after all
+uses arrive; missing, duplicate or extra submissions fail. The optimizer and
+scheduler state are retained across versions 0, 1, 2 and 3.
+
+Machine results and limitations belong to the report linked from
+[RLK #711](https://github.com/RL-Align/RL-Kernel/pull/711). Earlier diagnostic-loss
+results do not qualify this full trainer. Acceptance requires one uninterrupted
+three-update job, new generation after update three, complete evidence verification
+and a clean process exit. Do not infer DP2, a full model, multiple nodes, independent
+training-trajectory determinism or performance gains from this recipe.

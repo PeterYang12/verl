@@ -78,7 +78,11 @@ def validate_trainer_config(config):
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu": 1,
         "actor_rollout_ref.rollout.checkpoint_engine.backend": "naive",
     }
-    errors = [f"{key} must be {expected!r}" for key, expected in required.items() if value(config, key) != expected]
+    errors = [
+        f"{key} must be {expected!r}"
+        for key, expected in required.items()
+        if value(config, key) != expected
+    ]
     for key in (
         "actor_rollout_ref.model.mtp.enable",
         "actor_rollout_ref.model.lora.rank",
@@ -93,7 +97,9 @@ def validate_trainer_config(config):
             errors.append(f"{key} is unsupported in this trainer")
     if value(config, "actor_rollout_ref.rollout.n", 0) < 2:
         errors.append("GRPO requires rollout.n >= 2")
-    if value(config, "actor_rollout_ref.actor.ppo_mini_batch_size") != value(config, "data.train_batch_size"):
+    if value(config, "actor_rollout_ref.actor.ppo_mini_batch_size") != value(
+        config, "data.train_batch_size"
+    ):
         errors.append("ppo_mini_batch_size must equal train_batch_size (both count prompts)")
     if value(config, "trainer.v1.sync.parameter_sync_step", 1) != 1:
         errors.append("this acceptance recipe requires parameter_sync_step=1")
@@ -113,13 +119,17 @@ def logical_cases(input_ids):
     batch position, so a sample retains its canonical keys when reordered.
     """
     rows = list(input_ids.unbind())
-    if len(rows) != 1:
-        raise ValueError("RLK trainer currently requires one sequence per microbatch")
-    tokens = rows[0].detach().cpu().tolist()
-    if not tokens or any(type(token) is not int or token < 0 for token in tokens):
-        raise ValueError("nonempty unpadded integer token sequences are required")
-    identity = hashlib.sha256(json.dumps(tokens).encode()).hexdigest()
-    return [dict(id=identity, prompt_token_ids=tokens, response_token_ids=[])]
+    if not rows:
+        raise ValueError("nonempty microbatch required")
+    cases = {}
+    for row in rows:
+        tokens = row.detach().cpu().tolist()
+        if not tokens or any(type(token) is not int or token < 0 for token in tokens):
+            raise ValueError("nonempty unpadded integer token sequences are required")
+        identity = hashlib.sha256(json.dumps(tokens).encode()).hexdigest()
+        # Identical GRPO completions share a logical key; matching stays unique.
+        cases[identity] = dict(id=identity, prompt_token_ids=tokens, response_token_ids=[])
+    return list(cases.values())
 
 
 def validate_stage_acks(acks, manifest, version, previous_pids=None):
@@ -138,7 +148,8 @@ def validate_stage_acks(acks, manifest, version, previous_pids=None):
             raise RuntimeError("empty or overlapping pipeline state acknowledgment")
         checked.update(tensors)
     if set(checked) != set(manifest) or any(
-        checked[name]["sha256"] != item["sha256"] for name, item in manifest.items()
+        any(checked[name].get(key) != item[key] for key in ("sha256", "dtype", "shape"))
+        for name, item in manifest.items()
     ):
         raise RuntimeError("rollout readback does not cover the complete actor state")
     return pids
@@ -152,11 +163,28 @@ def strict_response_parity(actor, rollout, response_mask):
         raise TypeError("strict parity requires original FP32 actor and rollout scores")
     if actor.shape != rollout.shape or actor.shape != response_mask.shape:
         raise ValueError("response score shapes/mask must match")
+    if not torch.all((response_mask == 0) | (response_mask == 1)):
+        raise ValueError("response mask must contain only zero or one")
     selected = response_mask.bool()
     left, right = actor[selected].contiguous(), rollout[selected].contiguous()
     if not left.numel() or not torch.isfinite(left).all() or not torch.isfinite(right).all():
         raise RuntimeError("response parity requires nonempty finite observations")
     mismatch = int((left.view(torch.int32) != right.view(torch.int32)).sum())
     if mismatch:
-        raise RuntimeError(f"actor/rollout raw logprob mismatch: {mismatch}/{left.numel()}")
-    return {"compared_tokens": left.numel(), "mismatch_count": mismatch}
+        index = int(torch.nonzero(left.view(torch.int32) != right.view(torch.int32))[0])
+        position = torch.nonzero(selected)[index].tolist()
+        raise RuntimeError(
+            f"actor/rollout raw logprob mismatch: {mismatch}/{left.numel()}; "
+            f"first_position={position}, actor={float(left[index])}, rollout={float(right[index])}, "
+            f"actor_bits=0x{int(left.view(torch.int32)[index]) & 0xffffffff:08x}, "
+            f"rollout_bits=0x{int(right.view(torch.int32)[index]) & 0xffffffff:08x}"
+        )
+    delta = (left.double() - right.double()).abs()
+    return dict(
+        expected_tokens=int(selected.sum()),
+        compared_tokens=left.numel(),
+        mismatch_count=mismatch,
+        finite=True,
+        mean_abs_diff=float(delta.mean()),
+        max_abs_diff=float(delta.max()),
+    )

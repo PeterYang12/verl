@@ -1,3 +1,4 @@
+# isort: skip_file
 # Copyright 2026 Individual Contributor
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,16 +20,20 @@ import json
 import os
 from pathlib import Path
 
+from .runtime import prepare_worker
+
+prepare_worker()
+
+from . import trainer_engine  # noqa: F401
+
 import ray
 import torch
 import torch.distributed as dist
-
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.trainer.ppo.utils import Role
 from verl.trainer.ppo.v1.trainer_sync import PPOTrainerSync
 from verl.workers.engine_workers import ActorRolloutRefWorker
 
-from . import trainer_engine  # noqa: F401
 from .trainer_contract import strict_response_parity, validate_trainer_config
 from .trainer_rollout import RLKTrainerReplica
 from .trainer_sync import RLKPolicySync
@@ -52,7 +57,9 @@ class RLKActorWorker(ActorRolloutRefWorker):
         engine = self.actor.engine
         model = engine._rlk_models[0]
         covered = {
-            id(parameter) for parameters in model._rlk_checkpoint_export_parameters.values() for parameter in parameters
+            id(parameter)
+            for parameters in model._rlk_checkpoint_export_parameters.values()
+            for parameter in parameters
         }
         missing = [
             name
@@ -80,10 +87,9 @@ class RLKActorWorker(ActorRolloutRefWorker):
         return payload
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def rlk_score_sequences(self, cases, weight_version):
+    def rlk_score_sequences(self, cases, weight_version, micro_batch_size=1, trace_label=None):
         """Score new rollout tokens with the same live native actor after sync."""
         from tensordict import TensorDict
-
         from verl.utils import tensordict_utils as tu
 
         if self.actor.engine.rlk_weight_version != weight_version:
@@ -108,17 +114,63 @@ class RLKActorWorker(ActorRolloutRefWorker):
             global_token_num=None,
             compute_loss=False,
             disable_auto_offload=True,
-            micro_batch_size_per_gpu=1,
+            micro_batch_size_per_gpu=micro_batch_size,
             calculate_entropy=False,
         )
-        output = self.actor.infer_batch(data)
+        engine = self.actor.engine
+        observed = []
+
+        def actual_forward(_model, args, kwargs):
+            ids = kwargs.get("input_ids")
+            observed.append(
+                dict(
+                    shape=list(ids.shape),
+                    dtype=str(ids.dtype),
+                    stride=list(ids.stride()),
+                    tokens=ids.detach().cpu().tolist(),
+                )
+            )
+
+        handle = engine._rlk_models[0].register_forward_pre_hook(actual_forward, with_kwargs=True)
+        stop_trace = None
+        first_trace = os.environ.get("RLK_TRACE_FIRST_AUDIT") == "1" and not getattr(
+            self, "_rlk_traced", False
+        )
+        if trace_label is not None and not trace_label.startswith("failure-"):
+            raise ValueError("explicit actor traces are restricted to failed-audit diagnostics")
+        if first_trace or trace_label:
+            from examples.operators.dsv4_4l.boundary_trace import capture
+
+            stop_trace = capture(
+                engine._rlk_models[0],
+                Path(self.config.actor.megatron.rlk_evidence_dir)
+                / "traces"
+                / (f"actor-rank-{dist.get_rank()}" + (f"-{trace_label}" if trace_label else "")),
+                "actor",
+            )
+            self._rlk_traced = True
+        try:
+            output = self.actor.infer_batch(data)
+        finally:
+            handle.remove()
+            if stop_trace is not None:
+                stop_trace()
+        if not observed or any(
+            row["shape"][0] != min(micro_batch_size, len(cases)) for row in observed
+        ):
+            raise RuntimeError(f"actor did not execute actual requested batch: {observed}")
         if output is None:
             return None
         scores = [
-            row[len(case["prompt_ids"]) - 1 : len(case["prompt_ids"]) + len(case["response_ids"]) - 1]
+            row[
+                len(case["prompt_ids"])
+                - 1 : len(case["prompt_ids"])
+                + len(case["response_ids"])
+                - 1
+            ]
             for row, case in zip(output["log_probs"].unbind(), cases, strict=True)
         ]
-        return dict(weight_version=weight_version, scores=scores)
+        return dict(weight_version=weight_version, scores=scores, forward_batches=observed)
 
 
 class RLKVerlTrainer(PPOTrainerSync):
@@ -147,7 +199,9 @@ class RLKVerlTrainer(PPOTrainerSync):
                 dict(zip(manager.server_addresses, manager.server_handles, strict=True))
             )
         )
-        self.checkpoint_manager = RLKPolicySync(self.actor_rollout_wg, manager.server_handles, self.config.rlk.sync_dir)
+        self.checkpoint_manager = RLKPolicySync(
+            self.actor_rollout_wg, manager.server_handles, self.config.rlk.sync_dir
+        )
 
     def _compute_old_log_prob(self, batch, metrics):
         import transfer_queue as tq
@@ -156,10 +210,28 @@ class RLKVerlTrainer(PPOTrainerSync):
         data = tq.kv_batch_get(
             keys=batch.keys,
             partition_id=batch.partition_id,
-            select_fields=["old_log_probs", "rollout_log_probs", "response_mask"],
-        ).to_padded_tensor()
-        record = strict_response_parity(data["old_log_probs"], data["rollout_log_probs"], data["response_mask"])
-        record.update(global_steps=self.global_steps, weight_version=self.checkpoint_manager.version)
+            select_fields=[
+                "old_log_probs",
+                "rollout_log_probs",
+                "response_mask",
+                "prompts",
+                "responses",
+            ],
+        )
+        # Preserve native lengths: DSV4's BOS is token 0, also the padded export fill.
+        prompt_lengths = data["prompts"].offsets().diff().detach().cpu()
+        data = data.to_padded_tensor()
+        root = Path(self.config.rlk.sync_dir)
+        torch.save(
+            dict(data.items(), prompt_lengths=prompt_lengths),
+            root / f"parity-step{self.global_steps}-raw.pt",
+        )
+        record = strict_response_parity(
+            data["old_log_probs"], data["rollout_log_probs"], data["response_mask"]
+        )
+        record.update(
+            global_steps=self.global_steps, weight_version=self.checkpoint_manager.version
+        )
         root = Path(self.config.rlk.sync_dir)
         with (root / "parity.jsonl").open("a") as stream:
             stream.write(json.dumps(record) + "\n")
@@ -175,6 +247,28 @@ class RLKVerlTrainer(PPOTrainerSync):
             partition_id=batch.partition_id,
             select_fields=["advantages", "returns", "rm_scores", "response_mask"],
         ).to_padded_tensor()
+        metadata = tq.kv_batch_get(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            select_fields=["metrics", "extra_fields"],
+        )
+
+        def serial(value):
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().tolist()
+            if isinstance(value, dict):
+                return {str(k): serial(v) for k, v in value.items()}
+            if isinstance(value, tuple | list):
+                return [serial(v) for v in value]
+            if hasattr(value, "to_dict"):
+                return serial(value.to_dict())
+            if hasattr(value, "tolist"):
+                return serial(value.tolist())
+            if value is None or isinstance(value, str | int | float | bool):
+                return value
+            raise TypeError(f"unrecorded native AgentLoop metadata: {type(value)}")
+
+        native_agent_loop = serial(metadata)
         summaries = {}
         for name in ("advantages", "returns", "rm_scores"):
             tensor = data[name]
@@ -185,8 +279,13 @@ class RLKVerlTrainer(PPOTrainerSync):
                 nonzero=int(torch.count_nonzero(tensor)),
                 minimum=float(tensor.min()),
                 maximum=float(tensor.max()),
+                mean=float(tensor.float().mean()),
+                std=float(tensor.float().std(unbiased=False)),
+                values=tensor.tolist(),
             )
-        (Path(self.config.rlk.sync_dir) / f"training-batch-step{self.global_steps}.json").write_text(
+        (
+            Path(self.config.rlk.sync_dir) / f"training-batch-step{self.global_steps}.json"
+        ).write_text(
             json.dumps(
                 dict(
                     global_steps=self.global_steps,
@@ -194,57 +293,55 @@ class RLKVerlTrainer(PPOTrainerSync):
                     algorithm="grpo",
                     native_policy_loss="verl.workers.utils.losses.ppo_loss",
                     summaries=summaries,
+                    native_agent_loop=native_agent_loop,
+                    rewards_per_response=data["rm_scores"].sum(-1).tolist(),
+                    response_mask=data["response_mask"].tolist(),
                 ),
                 indent=2,
             )
         )
+        if summaries["advantages"]["nonzero"] == 0:
+            raise RuntimeError(
+                "all native GRPO advantages are zero; this is not an effective update"
+            )
         return batch
 
+    def on_init_end(self):
+        super().on_init_end()
+        from .acceptance import audit_version
+
+        audit_version(self)
+
     def on_step_end(self):
-        # Native synchronous trainer performs the actual live weight sync.
         super().on_step_end()
-        # Verify v1/v2/v3 immediately after each update, including the final
-        # update for which there is no following PPO batch to trigger old-logp.
-        prompts = [self.tokenizer.encode(prompt, add_special_tokens=True) for prompt in self.config.rlk.audit_prompts]
+        from .acceptance import audit_version, stress_current_version
 
-        async def generate():
-            from uuid import uuid4
+        audit_version(self)
+        repeats = int(self.config.rlk.get("stress_final_repeats", 0))
+        if self.global_steps == 3 and repeats:
+            stress_current_version(self, repeats)
 
-            server = self.llm_server_manager.server_handles[0]
-            return await asyncio.gather(
-                *[
-                    server.generate.remote(
-                        request_id=f"rlk-audit-{self.global_steps}-{uuid4().hex}",
-                        prompt_ids=prompt,
-                        sampling_params=dict(
-                            temperature=1.0,
-                            top_p=1.0,
-                            top_k=-1,
-                            logprobs=True,
-                            max_tokens=int(self.config.rlk.audit_response_length),
-                        ),
-                    )
-                    for prompt in prompts
-                ]
+    def _compute_metrics(self, batch, metrics, timing_raw, global_steps, epoch):
+        super()._compute_metrics(batch, metrics, timing_raw, global_steps, epoch)
+
+        def encode(value):
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().tolist()
+            if hasattr(value, "item"):
+                return value.item()
+            raise TypeError(type(value))
+
+        (Path(self.config.rlk.sync_dir) / f"metrics-step{global_steps}.json").write_text(
+            json.dumps(
+                dict(
+                    global_steps=global_steps,
+                    metrics=metrics,
+                    timing_seconds=timing_raw,
+                    rollout_gpus=2,
+                    total_job_gpus=4,
+                    includes_audit=True,
+                ),
+                indent=2,
+                default=encode,
             )
-
-        outputs = asyncio.run(generate())
-        cases = [
-            dict(prompt_ids=prompt, response_ids=output.token_ids)
-            for prompt, output in zip(prompts, outputs, strict=True)
-        ]
-        version = self.checkpoint_manager.version
-        replies = self.actor_rollout_wg.rlk_score_sequences(cases, version)
-        collected = [reply for reply in replies if reply is not None]
-        if len(collected) != 1 or collected[0]["weight_version"] != version:
-            raise RuntimeError("expected exactly one final actor PP output at the synced version")
-        records = []
-        for case, output, actor in zip(cases, outputs, collected[0]["scores"], strict=True):
-            if output.log_probs is None or output.extra_fields.get("global_steps") != self.global_steps:
-                raise RuntimeError("post-update rollout lacks raw scores or current policy metadata")
-            rollout = torch.tensor(output.log_probs, dtype=torch.float32)
-            checked = strict_response_parity(actor, rollout, torch.ones_like(actor, dtype=torch.bool))
-            records.append(dict(case, **checked))
-        (Path(self.config.rlk.sync_dir) / f"post-update-v{version}.json").write_text(
-            json.dumps(dict(global_steps=self.global_steps, weight_version=version, cases=records), indent=2)
         )

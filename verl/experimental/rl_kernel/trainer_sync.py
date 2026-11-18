@@ -51,7 +51,9 @@ class RLKPolicySync:
         return asyncio.run(self.update(global_steps))
 
     async def update(self, global_steps=None):
-        await asyncio.gather(*[server.abort_all_requests.remote(reset_prefix_cache=True) for server in self.servers])
+        await asyncio.gather(
+            *[server.abort_all_requests.remote(reset_prefix_cache=True) for server in self.servers]
+        )
         path = self.root / f"policy-{uuid4().hex}.pt"
         exports = self.actor_wg.rlk_export_policy(str(path))
         if not exports or len(exports) != 2:
@@ -60,14 +62,22 @@ class RLKPolicySync:
         if any(item != first for item in exports):
             raise RuntimeError("actor PP ranks disagree on exported state or version")
         version, manifest = first["weight_version"], first["manifest"]
-        if self.version is not None and version <= self.version:
+        if version != (0 if self.version is None else self.version + 1):
             raise RuntimeError("a trainer update did not advance the optimizer weight version")
         acks = await self.servers[0].rlk_load_policy.remote(str(path), global_steps)
+        (self.root / f"sync-v{version}-raw.json").write_text(
+            json.dumps(dict(manifest=manifest, stages=acks), indent=2)
+        )
         pids = validate_stage_acks(acks, manifest, version, self.pids)
         record = dict(global_steps=global_steps, weight_version=version, stages=acks)
         (self.root / f"sync-v{version}.json").write_text(json.dumps(record, indent=2))
         # Publish the new version and reopen only after every stage passed.
         self.version, self.pids, self.manifest = version, pids, manifest
         await asyncio.gather(*[server.resume_generation.remote() for server in self.servers])
-        path.unlink()
+        if version:
+            # Retain real post-update values so a later numerical failure can
+            # be replayed without recreating its stochastic training trajectory.
+            path.replace(self.root / f"policy-v{version}.pt")
+        else:
+            path.unlink()
         return {"rlk/weight_version": version, "rlk/synced_tensors": len(manifest)}
